@@ -18,7 +18,7 @@ from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageOps
 import cv2
 
 import streamlit as st
@@ -255,6 +255,7 @@ def load_model():
 
 
 def preprocess_image(pil_img: Image.Image, img_size: int = CFG.IMG_SIZE) -> torch.Tensor:
+    pil_img = ImageOps.exif_transpose(pil_img)
     rgb = np.array(pil_img.convert("RGB"))
     h, w = rgb.shape[:2]
 
@@ -329,6 +330,21 @@ EXPECTED_KEYS = [
     "protein_g",
 ]
 
+NUMERIC_KEYS = [
+    "servings_per_container",
+    "calories",
+    "total_fat_g",
+    "saturated_fat_g",
+    "trans_fat_g",
+    "cholesterol_mg",
+    "sodium_mg",
+    "total_carbohydrates_g",
+    "dietary_fiber_g",
+    "total_sugars_g",
+    "added_sugars_g",
+    "protein_g",
+]
+
 OCR_TO_JSON_PROMPT = """
 Convert the OCR text of a Nutrition Facts label into a strict JSON object.
 
@@ -366,36 +382,111 @@ def _extract_json_object(text: str) -> Optional[dict]:
         return None
 
 
+def _get_chat_content(resp) -> str:
+    """Works across huggingface_hub versions (attr vs dict)."""
+    try:
+        return resp.choices[0].message.content
+    except Exception:
+        try:
+            return resp.choices[0].message["content"]
+        except Exception:
+            return str(resp)
+
+
+def _ocr_text_from_output(ocr_out) -> str:
+    """Normalize OCR output across different return formats."""
+    if ocr_out is None:
+        return ""
+    if isinstance(ocr_out, str):
+        return ocr_out.strip()
+    if isinstance(ocr_out, dict):
+        return (ocr_out.get("generated_text") or ocr_out.get("text") or "").strip()
+    if isinstance(ocr_out, list) and len(ocr_out) > 0:
+        item = ocr_out[0]
+        if isinstance(item, str):
+            return item.strip()
+        if isinstance(item, dict):
+            return (item.get("generated_text") or item.get("text") or "").strip()
+        return str(item).strip()
+    for attr in ["generated_text", "text"]:
+        if hasattr(ocr_out, attr):
+            return str(getattr(ocr_out, attr) or "").strip()
+    return str(ocr_out).strip()
+
+
+def _to_number_or_none(x):
+    if x is None:
+        return None
+    if isinstance(x, (int, float)) and not (isinstance(x, float) and np.isnan(x)):
+        return float(x)
+    s = str(x).strip()
+    if s == "" or s.lower() in {"none", "null", "nan"}:
+        return None
+    s = s.replace(",", "")
+    m = re.search(r"-?\d+(\.\d+)?", s)
+    return float(m.group()) if m else None
+
+
+def _clean_parsed_nutrition(parsed: dict) -> dict:
+    clean = {k: parsed.get(k, None) for k in EXPECTED_KEYS}
+
+    for k in ["product_name", "serving_size"]:
+        v = clean.get(k, None)
+        if v is None:
+            continue
+        v = str(v).strip()
+        clean[k] = v if v else None
+
+    for k in NUMERIC_KEYS:
+        clean[k] = _to_number_or_none(clean.get(k, None))
+
+    if clean.get("servings_per_container") is not None:
+        val = clean["servings_per_container"]
+        if abs(val - round(val)) < 1e-6:
+            clean["servings_per_container"] = int(round(val))
+
+    return clean
+
+
 def preprocess_label_for_ocr(pil_img: Image.Image) -> Image.Image:
     """
-    Light label enhancement to improve OCR:
+    Label enhancement for better OCR:
+    - EXIF transpose (fix rotated phone photos)
     - upscale
-    - increase contrast slightly
+    - contrast (CLAHE)
+    - mild sharpening
     """
+    pil_img = ImageOps.exif_transpose(pil_img)
     img = np.array(pil_img.convert("RGB"))
     h, w = img.shape[:2]
 
-    # upscale to help OCR (cap size for speed)
-    target_w = 1400
+    target_w = 1600
     if w < target_w:
         scale = target_w / max(1, w)
         nh, nw = int(h * scale), int(w * scale)
         img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_CUBIC)
 
-    # contrast + sharpness
     lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l2 = clahe.apply(l)
-    lab2 = cv2.merge([l2, a, b])
-    img2 = cv2.cvtColor(lab2, cv2.COLOR_LAB2RGB)
+    img2 = cv2.cvtColor(cv2.merge([l2, a, b]), cv2.COLOR_LAB2RGB)
+
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+    img2 = cv2.filter2D(img2, -1, kernel)
 
     return Image.fromarray(img2)
 
 
-def _pil_to_png_bytes(pil_img: Image.Image) -> bytes:
+def _pil_to_image_bytes(pil_img: Image.Image) -> bytes:
     buf = io.BytesIO()
     pil_img.save(buf, format="PNG")
+    data = buf.getvalue()
+    if len(data) <= 4_500_000:  # ~4.5MB
+        return data
+
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=92, optimize=True)
     return buf.getvalue()
 
 
@@ -410,37 +501,29 @@ def extract_nutrition_ocr_hf(pil_img: Image.Image) -> Tuple[Optional[Dict[str, A
         return None, "HF clients not available. Check HF_TOKEN and requirements."
 
     try:
-        # 1) OCR text using TrOCR
         prep = preprocess_label_for_ocr(pil_img)
-        img_bytes = _pil_to_png_bytes(prep)
+        img_bytes = _pil_to_image_bytes(prep)
 
-        ocr_out = ocr_client.image_to_text(img_bytes)
-
-        # normalize return types
-        if isinstance(ocr_out, list) and ocr_out:
-            ocr_text = ocr_out[0].get("generated_text") or ocr_out[0].get("text") or str(ocr_out[0])
-        elif isinstance(ocr_out, dict):
-            ocr_text = ocr_out.get("generated_text") or ocr_out.get("text") or str(ocr_out)
-        else:
-            ocr_text = str(ocr_out)
+        # IMPORTANT: keyword arg for compatibility across versions
+        ocr_out = ocr_client.image_to_text(image=img_bytes)
+        ocr_text = _ocr_text_from_output(ocr_out)
 
         ocr_text = (ocr_text or "").strip()
         if len(ocr_text) < 10:
             return None, "OCR text is empty/too short. Take a closer, clearer label photo."
 
-        # 2) Parse OCR text into strict JSON using Qwen chat
         messages = [
             {"role": "system", "content": "You extract Nutrition Facts. Output ONLY JSON."},
             {"role": "user", "content": OCR_TO_JSON_PROMPT + "\n\nOCR TEXT:\n" + ocr_text},
         ]
-        resp = chat_client.chat_completion(messages=messages, max_tokens=500, temperature=0.1)
-        llm_text = resp.choices[0].message["content"]
+        resp = chat_client.chat_completion(messages=messages, max_tokens=600, temperature=0.1)
+        llm_text = _get_chat_content(resp)
 
         parsed = _extract_json_object(llm_text)
         if not isinstance(parsed, dict):
             return None, "Could not parse JSON from the AI output. Try a clearer close-up label photo."
 
-        clean = {k: parsed.get(k, None) for k in EXPECTED_KEYS}
+        clean = _clean_parsed_nutrition(parsed)
         clean["raw_ocr_text"] = ocr_text
         clean["raw_llm_text"] = llm_text
         return clean, None
@@ -458,7 +541,6 @@ def transcribe_audio_hf(audio_bytes: bytes) -> Tuple[Optional[str], Optional[str
         return None, "HF_TOKEN missing. Add it in Streamlit Secrets to enable voice."
 
     try:
-        # different hub versions expose different method names; try best-effort
         if hasattr(client, "automatic_speech_recognition"):
             res = client.automatic_speech_recognition(audio=audio_bytes)
             if isinstance(res, str):
@@ -467,7 +549,7 @@ def transcribe_audio_hf(audio_bytes: bytes) -> Tuple[Optional[str], Optional[str
                 return res["text"], None
 
         if hasattr(client, "audio_to_text"):
-            res = client.audio_to_text(audio_bytes)
+            res = client.audio_to_text(audio=audio_bytes)
             if isinstance(res, str):
                 return res, None
             if isinstance(res, dict) and "text" in res:
@@ -548,10 +630,10 @@ def totals_today() -> Dict[str, float]:
         return {"calories": 0.0, "protein": 0.0, "carb": 0.0, "fat": 0.0}
     df = pd.DataFrame(st.session_state.meal_log)
     return {
-        "calories": float(df["total_calories"].sum()),
-        "protein": float(df["total_protein"].sum()),
-        "carb": float(df["total_carb"].sum()),
-        "fat": float(df["total_fat"].sum()),
+        "calories": float(df.get("total_calories", pd.Series(dtype=float)).sum()),
+        "protein": float(df.get("total_protein", pd.Series(dtype=float)).sum()),
+        "carb": float(df.get("total_carb", pd.Series(dtype=float)).sum()),
+        "fat": float(df.get("total_fat", pd.Series(dtype=float)).sum()),
     }
 
 
@@ -565,6 +647,7 @@ def add_to_log(name: str, nutrition: Dict[str, Any]):
             "total_fat": float(nutrition.get("total_fat", nutrition.get("total_fat_g", 0)) or 0),
             "total_carb": float(nutrition.get("total_carb", nutrition.get("total_carbohydrates_g", 0)) or 0),
             "total_protein": float(nutrition.get("total_protein", nutrition.get("protein_g", 0)) or 0),
+            "sugar_g": float(nutrition.get("total_sugars_g", nutrition.get("sugar_g", 0)) or 0),
         }
     )
 
@@ -737,15 +820,20 @@ with tab_ocr:
         raw_ocr = data.pop("raw_ocr_text", "")
         raw_llm = data.pop("raw_llm_text", "")
 
-        st.markdown("### ✅ Extracted Nutrition JSON")
-        st.code(json.dumps(data, indent=2), language="json")
+        st.markdown("### ✅ Extracted Nutrition (editable)")
 
         df_show = pd.DataFrame(list(data.items()), columns=["Field", "Value"])
-        st.dataframe(df_show, use_container_width=True)
+        edited_df = st.data_editor(df_show, use_container_width=True, num_rows="fixed", key="ocr_editor")
 
-        prod_name = st.text_input("Product name for log", value=data.get("product_name") or "Packaged Food")
+        edited = dict(zip(edited_df["Field"].tolist(), edited_df["Value"].tolist()))
+        edited = _clean_parsed_nutrition(edited)
+
+        st.markdown("### 📦 Final JSON (after edits)")
+        st.code(json.dumps(edited, indent=2), language="json")
+
+        prod_name = st.text_input("Product name for log", value=edited.get("product_name") or "Packaged Food")
         if st.button("➕ Add Label Item to Meal Log", use_container_width=True):
-            add_to_log(prod_name, data)
+            add_to_log(prod_name, edited)
             st.success("Added to meal log ✅")
 
         with st.expander("Debug: raw OCR text"):
@@ -864,32 +952,65 @@ with tab_shop:
         st.info("Shopping list is empty.")
 
     st.markdown("---")
-    st.markdown("### ⚖️ Compare Two Products (manual)")
+    st.markdown("### ⚖️ Compare Two Products (choose from your Meal Log)")
 
-    def manual_entry(prefix: str) -> Dict[str, Any]:
-        st.markdown(f"**{prefix}**")
-        name = st.text_input(f"{prefix} name", key=f"{prefix}_name")
-        cal = st.number_input(f"{prefix} calories", 0, 3000, 0, key=f"{prefix}_cal")
-        pro = st.number_input(f"{prefix} protein (g)", 0, 200, 0, key=f"{prefix}_pro")
-        carb = st.number_input(f"{prefix} carbs (g)", 0, 300, 0, key=f"{prefix}_carb")
-        fat = st.number_input(f"{prefix} fat (g)", 0, 200, 0, key=f"{prefix}_fat")
-        sugar = st.number_input(f"{prefix} sugar (g)", 0, 200, 0, key=f"{prefix}_sugar")
-        return {"name": name or prefix, "calories": cal, "protein": pro, "carb": carb, "fat": fat, "sugar": sugar}
+    if len(st.session_state.meal_log) < 2:
+        st.info("Log at least 2 items (scan a meal or OCR a label), then compare them here.")
+    else:
+        options = [
+            f"{i+1}. {m['food']} @ {m['time']} — {float(m.get('total_calories',0) or 0):.0f} kcal"
+            for i, m in enumerate(st.session_state.meal_log)
+        ]
 
-    x, y = st.columns(2)
-    with x:
-        A = manual_entry("Product A")
-    with y:
-        B = manual_entry("Product B")
+        cA, cB = st.columns(2)
+        with cA:
+            idx_a = st.selectbox(
+                "Choose Product A",
+                range(len(options)),
+                format_func=lambda i: options[i],
+                key="cmp_a_idx",
+            )
+        with cB:
+            idx_b = st.selectbox(
+                "Choose Product B",
+                range(len(options)),
+                format_func=lambda i: options[i],
+                key="cmp_b_idx",
+            )
 
-    if st.button("⚖️ Compare", type="primary", use_container_width=True):
-        comp = pd.DataFrame([A, B]).set_index("name")
-        st.dataframe(comp, use_container_width=True)
+        if idx_a == idx_b:
+            st.warning("Pick two different items to compare.")
+        else:
+            a = st.session_state.meal_log[idx_a]
+            b = st.session_state.meal_log[idx_b]
 
-        a_key = (A["calories"], A["sugar"])
-        b_key = (B["calories"], B["sugar"])
-        winner = A["name"] if a_key <= b_key else B["name"]
-        st.success(f"✅ Better pick (lower calories/sugar): **{winner}**")
+            A = {
+                "name": a["food"],
+                "calories": float(a.get("total_calories", 0) or 0),
+                "protein": float(a.get("total_protein", 0) or 0),
+                "carb": float(a.get("total_carb", 0) or 0),
+                "fat": float(a.get("total_fat", 0) or 0),
+                "sugar": float(a.get("sugar_g", 0) or 0),
+            }
+            B = {
+                "name": b["food"],
+                "calories": float(b.get("total_calories", 0) or 0),
+                "protein": float(b.get("total_protein", 0) or 0),
+                "carb": float(b.get("total_carb", 0) or 0),
+                "fat": float(b.get("total_fat", 0) or 0),
+                "sugar": float(b.get("sugar_g", 0) or 0),
+            }
+
+            if st.button("⚖️ Compare", type="primary", use_container_width=True):
+                comp = pd.DataFrame([A, B]).set_index("name")
+                st.dataframe(comp, use_container_width=True)
+
+                # Winner: lower calories, then lower sugar, then higher protein
+                def rank(x):
+                    return (x["calories"], x["sugar"], -x["protein"])
+
+                winner = A["name"] if rank(A) <= rank(B) else B["name"]
+                st.success(f"✅ Better pick (lower calories/sugar, higher protein tie-break): **{winner}**")
 
 
 # =========================================================
@@ -943,7 +1064,7 @@ with tab_chat:
                 {"role": "user", "content": message},
             ]
             resp = client.chat_completion(messages=messages, max_tokens=400, temperature=0.7)
-            return resp.choices[0].message["content"]
+            return _get_chat_content(resp)
         except Exception:
             return None
 
