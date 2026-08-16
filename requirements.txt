@@ -1,21 +1,15 @@
 streamlit>=1.36
 
-# Core ML
+# Core ML (Nutrition model)
 torch>=2.1
+torchvision>=0.16
 timm>=0.9
 
-# Data / imaging
+# Imaging / data
 opencv-python-headless
 pillow
 numpy
 pandas
 
-# Hugging Face
+# Hugging Face (InferenceClient + hf_hub_download)
 huggingface_hub>=0.26
-transformers>=4.46.0
-accelerate>=0.34.0
-
-# Common transformer runtime deps (prevents many “missing package” errors)
-safetensors
-sentencepiece
-protobuf
