@@ -1,980 +1,924 @@
-import os, io, re, json, math, random, time
+# =====================================================================================
+#  🥗 LIVE AI NUTRITION & SMART SHOPPING ASSISTANT
+#  Full Streamlit application
+#  Model: custom RGB-D ConvNeXt (Nutrition5k) hosted on Hugging Face Hub
+#  OCR + Chatbot: Hugging Face Inference API (hosted, no heavy local weights)
+# =====================================================================================
+
+import os
+import io
+import json
+import base64
+import re
 from datetime import datetime, date
-from dataclasses import dataclass, field
-from typing import Dict, Any, Optional, List
 
 import numpy as np
 import pandas as pd
+import cv2
 from PIL import Image
 
+import torch
+import torch.nn as nn
+import timm
+
 import streamlit as st
-import plotly.express as px
 import plotly.graph_objects as go
-
-# =========================================================
-# 📦 OPTIONAL DEPENDENCY GUARDS
-# =========================================================
-try:
-    import cv2
-    HAS_CV2 = True
-except Exception:
-    HAS_CV2 = False
-    cv2 = None
+import plotly.express as px
+from huggingface_hub import hf_hub_download, InferenceClient
 
 try:
-    import pytesseract
-    TESS_OK = True
+    from streamlit_option_menu import option_menu
+    HAS_OPTION_MENU = True
 except Exception:
-    TESS_OK = False
+    HAS_OPTION_MENU = False
 
 try:
-    import torch
-    import torch.nn as nn
-    import timm
-    HAS_TORCH = True
+    from streamlit_lottie import st_lottie
+    import requests
+    HAS_LOTTIE = True
 except Exception:
-    HAS_TORCH = False
-    torch = None
+    HAS_LOTTIE = False
 
-# =========================================================
-# 🎨 PAGE CONFIG
-# =========================================================
-st.set_page_config(
-    page_title="Live AI Nutrition Assistant",
-    page_icon="🥗",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+try:
+    from gtts import gTTS
+    HAS_TTS = True
+except Exception:
+    HAS_TTS = False
 
-# =========================================================
-# 🎨 CUSTOM CSS + ANIMATIONS
-# =========================================================
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
 
-html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-.main { background: linear-gradient(135deg, #e8f5e9 0%, #f1f8e9 100%); }
+# =====================================================================================
+# 1. CONFIG
+# =====================================================================================
+class CFG:
+    MODEL_REPO_ID  = st.secrets.get("MODEL_REPO_ID", "Anton-Atef/AI-nutrition-assistant")
+    MODEL_FILENAME = st.secrets.get("MODEL_FILENAME", "best_nutrition_rgbd.pt")
 
-/* ---------- Animated gradient header ---------- */
-.hero-header {
-    background: linear-gradient(-45deg, #2e7d32, #66bb6a, #43a047, #81c784);
-    background-size: 400% 400%;
-    animation: gradientShift 10s ease infinite;
-    padding: 26px 24px;
-    border-radius: 20px;
-    color: white;
-    box-shadow: 0 10px 30px rgba(46,125,50,0.35);
-    margin-bottom: 18px;
-    animation: gradientShift 10s ease infinite, fadeInDown 0.7s ease;
-}
-@keyframes gradientShift {
-    0% {background-position:0% 50%;}
-    50% {background-position:100% 50%;}
-    100% {background-position:0% 50%;}
-}
-@keyframes fadeInDown {
-    from {opacity:0; transform:translateY(-16px);}
-    to {opacity:1; transform:translateY(0);}
-}
-.hero-header h1 { margin:0; font-size:2rem; font-weight:800; }
-.hero-header p { margin:4px 0 0; opacity:0.95; }
+    CHAT_MODEL = st.secrets.get("CHAT_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+    OCR_MODEL  = st.secrets.get("OCR_MODEL", "Qwen/Qwen2-VL-7B-Instruct")
+    ASR_MODEL  = st.secrets.get("ASR_MODEL", "openai/whisper-large-v3")
 
-/* ---------- Fade-in for cards ---------- */
-@keyframes fadeInUp {
-    from {opacity:0; transform:translateY(14px);}
-    to {opacity:1; transform:translateY(0);}
-}
-.food-card {
-    background: white; border-radius: 20px; padding: 20px;
-    box-shadow: 0 10px 30px rgba(0,0,0,0.08); margin-bottom:15px;
-    animation: fadeInUp 0.5s ease;
-    transition: transform 0.25s ease, box-shadow 0.25s ease;
-    border: 1px solid rgba(76,175,80,0.12);
-}
-.food-card:hover {
-    transform: translateY(-6px) scale(1.01);
-    box-shadow: 0 16px 34px rgba(76,175,80,0.25);
-}
+    HF_TOKEN = st.secrets.get("HF_TOKEN", os.environ.get("HF_TOKEN", None))
 
-.macro-badge {
-    display:inline-block; padding:8px 14px; border-radius:12px;
-    font-weight:600; font-size:14px; margin:5px;
-    animation: pop 0.35s ease;
-}
-@keyframes pop { from{transform:scale(0.75); opacity:0;} to{transform:scale(1); opacity:1;} }
+    IMG_SIZE = 256
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    TARGET_COLS_DEFAULT = ["total_mass", "total_calories", "total_fat", "total_carb", "total_protein"]
 
-/* ---------- KPI cards ---------- */
-.kpi-card {
-    background: white; border-radius: 18px; padding: 18px;
-    text-align:center; box-shadow: 0 8px 22px rgba(0,0,0,0.08);
-    animation: fadeInUp 0.5s ease; transition: transform 0.2s ease;
-}
-.kpi-card:hover { transform: translateY(-5px); }
-.kpi-value { font-size:1.6rem; font-weight:800; margin:0; }
-.kpi-label { font-size:0.85rem; color:#666; margin:0; }
-.kpi-sub { font-size:0.75rem; color:#999; margin-top:4px; }
 
-/* ---------- Animated progress bars ---------- */
-.progress-wrap { background:#e8f5e9; border-radius:12px; height:18px; overflow:hidden; margin-bottom:10px; }
-.progress-fill {
-    height:100%; border-radius:12px;
-    background: linear-gradient(90deg,#66bb6a,#2e7d32);
-    animation: growBar 1s ease-out;
-}
-@keyframes growBar { from{width:0%;} }
-
-/* ---------- Live camera pulse dot ---------- */
-.pulse-dot {
-    height:12px; width:12px; background:#e53935; border-radius:50%;
-    display:inline-block; margin-right:8px; animation: pulse 1.4s infinite;
-}
-@keyframes pulse {
-    0% { box-shadow: 0 0 0 0 rgba(229,57,53,0.6); }
-    70% { box-shadow: 0 0 0 10px rgba(229,57,53,0); }
-    100% { box-shadow: 0 0 0 0 rgba(229,57,53,0); }
-}
-
-/* ---------- Chat bubbles ---------- */
-.chat-bubble-user {
-    background:#dcf8c6; padding:10px 16px; border-radius:16px 16px 2px 16px;
-    display:inline-block; max-width:80%; margin:6px 0; float:right; clear:both;
-    animation: fadeInUp 0.3s ease;
-}
-.chat-bubble-bot {
-    background:#f1f0f0; padding:10px 16px; border-radius:16px 16px 16px 2px;
-    display:inline-block; max-width:80%; margin:6px 0; float:left; clear:both;
-    animation: fadeInUp 0.3s ease;
-}
-
-/* Buttons glow on hover */
-.stButton>button {
-    transition: all 0.2s ease;
-    border-radius: 12px !important;
-}
-.stButton>button:hover {
-    box-shadow: 0 0 14px rgba(76,175,80,0.5);
-    transform: translateY(-2px);
-}
-</style>
-""", unsafe_allow_html=True)
-
-# =========================================================
-# ⚙️ CONSTANTS
-# =========================================================
-CFG_IMG_SIZE = 256
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-FOOD_DB = {
-    "salad": {"calories": 35, "protein": 2.5, "fat": 0.8, "carb": 6, "fiber": 2.5, "sugar": 2.2, "name": "Vegetable Salad"},
-    "spaghetti": {"calories": 158, "protein": 5.8, "fat": 0.9, "carb": 30.9, "fiber": 1.8, "sugar": 0.6, "name": "Spicy Tomato Fusilli"},
-    "sushi": {"calories": 130, "protein": 6, "fat": 1.5, "carb": 22, "fiber": 0.8, "sugar": 3, "name": "Salmon Bowl"},
-    "pizza": {"calories": 266, "protein": 11, "fat": 10, "carb": 33, "fiber": 2.3, "sugar": 3.6, "name": "Pizza Slice"},
-    "burger": {"calories": 295, "protein": 17, "fat": 14, "carb": 24, "fiber": 1.5, "sugar": 4, "name": "Chicken Burger"},
-    "apple": {"calories": 52, "protein": 0.3, "fat": 0.2, "carb": 14, "fiber": 2.4, "sugar": 10, "name": "Apple"},
-    "banana": {"calories": 89, "protein": 1.1, "fat": 0.3, "carb": 23, "fiber": 2.6, "sugar": 12, "name": "Banana"},
-    "chicken breast": {"calories": 165, "protein": 31, "fat": 3.6, "carb": 0, "fiber": 0, "sugar": 0, "name": "Chicken Breast"},
-    "rice": {"calories": 130, "protein": 2.4, "fat": 0.3, "carb": 28, "fiber": 0.4, "sugar": 0.05, "name": "Rice"},
-    "salmon": {"calories": 208, "protein": 20, "fat": 13, "carb": 0, "fiber": 0, "sugar": 0, "name": "Salmon"},
-    "yogurt": {"calories": 59, "protein": 3.5, "fat": 0.4, "carb": 5, "fiber": 0, "sugar": 3.2, "name": "Greek Yogurt"},
-    "cake": {"calories": 371, "protein": 5, "fat": 16, "carb": 52, "fiber": 0.8, "sugar": 31, "name": "Chocolate Cake"},
-}
+st.set_page_config(
+    page_title="AI Nutrition & Shopping Assistant",
+    page_icon="🥗",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# =========================================================
-# 🗂️ SESSION STATE
-# =========================================================
-defaults = {
-    "meals": [], "shopping_list": [], "chat_history": [],
-    "user_profile": {"age": 25, "sex": "Male", "weight": 70, "height": 175, "activity": "Moderate", "goal": "Maintenance"},
-    "daily_target": None,
-    "last_label": None,
-    "last_label_raw": "",
-    "last_label_warn": None,
-}
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
 
-# =========================================================
-# 🧮 NUTRITION MATH HELPERS
-# =========================================================
-def calculate_bmr(w, h, age, sex):
-    if sex == "Male":
-        return 88.362 + (13.397 * w) + (4.799 * h) - (5.677 * age)
-    return 447.593 + (9.247 * w) + (3.098 * h) - (4.330 * age)
+# =====================================================================================
+# 2. THEME / CSS / ANIMATIONS
+# =====================================================================================
+def inject_css():
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap');
 
-def calculate_tdee(bmr, activity):
-    mult = {"Sedentary": 1.2, "Light": 1.375, "Moderate": 1.55, "Active": 1.725, "Very Active": 1.9}
-    return bmr * mult.get(activity, 1.55)
+    html, body, [class*="css"]  { font-family: 'Poppins', sans-serif; }
 
-def calculate_goals(tdee, weight, goal):
-    if goal == "Weight Loss": cal = tdee - 500
-    elif goal == "Muscle Gain": cal = tdee + 300
-    else: cal = tdee
-
-    if goal == "Muscle Gain": p = weight * 2.2
-    elif goal == "Weight Loss": p = weight * 2.0
-    else: p = weight * 1.8
-
-    f = (cal * 0.25) / 9
-    c = max((cal - (p * 4 + f * 9)) / 4, 0)  # 🔧 fixed: clamp carbs at 0
-    return {"calories": round(cal), "protein": round(p), "fat": round(f), "carb": round(c), "fiber": 25}
-
-def get_today_meals():
-    today = date.today().isoformat()
-    return [m for m in st.session_state.meals if m.get("date") == today]
-
-def get_totals():
-    meals = get_today_meals()
-    tot = {"calories": 0, "protein": 0, "fat": 0, "carb": 0, "fiber": 0}
-    for m in meals:
-        n = m["nutrition"]
-        for k in tot:
-            tot[k] += n.get(k, 0)
-    return tot
-
-# =========================================================
-# 🧠 RGB-D MODEL (Nutrition5k checkpoint from Hugging Face)
-# =========================================================
-if HAS_TORCH:
-    class NutritionNet(nn.Module):
-        def __init__(self, backbone_name="convnext_small", in_chans=4, out_dim=5):
-            super().__init__()
-            self.backbone = timm.create_model(
-                backbone_name, pretrained=False, in_chans=in_chans,
-                num_classes=0, global_pool="avg"
-            )
-            feat_dim = self.backbone.num_features
-            self.head = nn.Sequential(
-                nn.LayerNorm(feat_dim), nn.Linear(feat_dim, 512),
-                nn.GELU(), nn.Dropout(0.20), nn.Linear(512, out_dim)
-            )
-
-        def forward(self, x):
-            return self.head(self.backbone(x))
-
-    @st.cache_resource(show_spinner="🔽 Downloading Nutrition5k model (first run only)...")
-    def load_nutrition_model():
-        from huggingface_hub import hf_hub_download
-        try:
-            ckpt_path = hf_hub_download(
-                repo_id="Anton-Atef/AI-nutrition-assistant",
-                filename="best_nutrition_rgbd.pt",
-                repo_type="model"
-            )
-        except Exception as e:
-            st.warning(f"Could not download Nutrition5k checkpoint: {e}")
-            return None, None, None
-        try:
-            ckpt = torch.load(ckpt_path, map_location="cpu")
-            y_mean = np.array(ckpt["y_mean"], dtype=np.float32)
-            y_std = np.array(ckpt["y_std"], dtype=np.float32)
-            cols = ckpt.get("target_cols", ["total_mass", "total_calories", "total_fat", "total_carb", "total_protein"])
-            model = NutritionNet(ckpt.get("backbone", "convnext_small"), in_chans=ckpt.get("in_chans", 4), out_dim=len(cols))
-            model.load_state_dict(ckpt["model"])
-            model.eval()
-            return model, (y_mean, y_std), cols
-        except Exception as e:
-            st.warning(f"Could not load Nutrition5k checkpoint: {e}")
-            return None, None, None
-else:
-    def load_nutrition_model():
-        return None, None, None
-
-@st.cache_resource
-def load_food_classifier():
-    try:
-        from transformers import pipeline
-        return pipeline("image-classification", model="nateraw/food", top_k=3)
-    except Exception:
-        return None
-
-def predict_with_rgbd_model(pil_img, model_data):
-    if model_data[0] is None:
-        return None
-    model, (y_mean, y_std), cols = model_data
-    try:
-        img = pil_img.resize((CFG_IMG_SIZE, CFG_IMG_SIZE))
-        rgb = np.array(img).astype(np.float32) / 255.0
-        rgb = (rgb - IMAGENET_MEAN) / IMAGENET_STD
-
-        # 🔧 fixed: neutral mid-range depth (no physical sensor on phone/webcam)
-        depth = np.full((CFG_IMG_SIZE, CFG_IMG_SIZE, 1), 0.5, dtype=np.float32)
-        depth = (depth - 0.5) / 0.25
-
-        img4 = np.concatenate([rgb, depth], axis=2)
-        x = torch.from_numpy(img4).permute(2, 0, 1).unsqueeze(0).float()
-        with torch.no_grad():
-            pred = model(x).numpy()[0]
-        pred = pred * y_std + y_mean
-        mapping = {c: v for c, v in zip(cols, pred)}
-        return {
-            "name": "AI Estimated Dish",
-            "mass": float(max(mapping.get("total_mass", 250), 1)),
-            "calories": float(max(mapping.get("total_calories", 200), 0)),
-            "fat": float(max(mapping.get("total_fat", 10), 0)),
-            "carb": float(max(mapping.get("total_carb", 18), 0)),
-            "protein": float(max(mapping.get("total_protein", 12), 0)),
-            "fiber": 2.0, "sugar": 3.0
-        }
-    except Exception as e:
-        st.error(f"RGBD inference failed: {e}")
-        return None
-
-def estimate_from_food_db(label: str, grams: float):
-    label = label.lower()
-    best = None
-    for k, v in FOOD_DB.items():
-        if k in label:
-            best = v
-            break
-    if not best:
-        best = FOOD_DB["salad"]
-    factor = grams / 100
-    return {
-        "name": best["name"],
-        "calories": round(best["calories"] * factor, 1),
-        "protein": round(best["protein"] * factor, 1),
-        "fat": round(best["fat"] * factor, 1),
-        "carb": round(best["carb"] * factor, 1),
-        "fiber": round(best.get("fiber", 0) * factor, 1),
-        "sugar": round(best.get("sugar", 0) * factor, 1),
-        "mass": grams
+    .stApp {
+        background: linear-gradient(160deg, #eafff0 0%, #ffffff 45%, #f2fff6 100%);
     }
 
-# =========================================================
-# 🧾 NUTRITION LABEL OCR — (your requested style, kept as-is)
-# =========================================================
-EXPECTED_KEYS = [
-    "product_name", "serving_size", "servings_per_container",
-    "calories", "total_fat_g", "saturated_fat_g", "trans_fat_g",
-    "cholesterol_mg", "sodium_mg", "total_carbohydrates_g",
-    "dietary_fiber_g", "total_sugars_g", "added_sugars_g", "protein_g",
+    /* Hero header */
+    .hero {
+        background: linear-gradient(120deg, #1b5e20 0%, #43a047 55%, #9ccc65 100%);
+        padding: 34px 40px;
+        border-radius: 24px;
+        color: white;
+        margin-bottom: 22px;
+        box-shadow: 0 12px 30px rgba(27,94,32,0.25);
+        animation: fadeInDown 0.7s ease;
+    }
+    .hero h1 { margin: 0; font-weight: 800; font-size: 2.1rem;}
+    .hero p { margin: 6px 0 0 0; opacity: 0.92; font-size: 1.02rem;}
+
+    /* Cards */
+    .card {
+        background: white;
+        border-radius: 20px;
+        padding: 20px 22px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.06);
+        transition: transform .25s ease, box-shadow .25s ease;
+        animation: fadeInUp .6s ease;
+        margin-bottom: 16px;
+    }
+    .card:hover { transform: translateY(-4px); box-shadow: 0 14px 30px rgba(0,0,0,0.10); }
+
+    .metric-badge {
+        display:inline-block; padding: 4px 12px; border-radius: 999px;
+        font-size: 0.78rem; font-weight:600; color:white;
+        background: linear-gradient(90deg,#43a047,#2e7d32);
+    }
+
+    .macro-pill {
+        border-radius: 16px; padding: 14px 16px; color:white; font-weight:600;
+        text-align:center; animation: popIn .5s ease;
+    }
+
+    div.stButton > button {
+        border-radius: 14px !important;
+        border: none !important;
+        background: linear-gradient(90deg,#2e7d32,#66bb6a) !important;
+        color: white !important;
+        font-weight: 600 !important;
+        padding: 0.55rem 1.2rem !important;
+        transition: all .2s ease-in-out !important;
+    }
+    div.stButton > button:hover {
+        transform: scale(1.03);
+        box-shadow: 0 6px 18px rgba(46,125,50,0.35);
+    }
+
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg,#1b5e20,#2e7d32);
+    }
+    section[data-testid="stSidebar"] * { color: white !important; }
+
+    @keyframes fadeInDown { from{opacity:0; transform:translateY(-16px);} to{opacity:1; transform:translateY(0);} }
+    @keyframes fadeInUp   { from{opacity:0; transform:translateY(16px);}  to{opacity:1; transform:translateY(0);} }
+    @keyframes popIn      { from{opacity:0; transform:scale(.9);} to{opacity:1; transform:scale(1);} }
+
+    ::-webkit-scrollbar { width: 8px; }
+    ::-webkit-scrollbar-thumb { background:#a5d6a7; border-radius:10px; }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def load_lottie(url):
+    if not HAS_LOTTIE:
+        return None
+    try:
+        r = requests.get(url, timeout=4)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        return None
+    return None
+
+
+# =====================================================================================
+# 3. MODEL DEFINITION + LOADING  (RGB-D ConvNeXt, matches training notebook)
+# =====================================================================================
+class NutritionNet(nn.Module):
+    def __init__(self, backbone_name, in_chans=4, out_dim=5):
+        super().__init__()
+        self.backbone = timm.create_model(
+            backbone_name, pretrained=False, in_chans=in_chans,
+            num_classes=0, global_pool="avg"
+        )
+        feat_dim = self.backbone.num_features
+        self.head = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.Linear(feat_dim, 512),
+            nn.GELU(),
+            nn.Dropout(0.20),
+            nn.Linear(512, out_dim),
+        )
+
+    def forward(self, x):
+        return self.head(self.backbone(x))
+
+
+@st.cache_resource(show_spinner=False)
+def load_nutrition_model():
+    """Downloads best_nutrition_rgbd.pt from the HF Hub and builds the model."""
+    ckpt_path = hf_hub_download(
+        repo_id=CFG.MODEL_REPO_ID,
+        filename=CFG.MODEL_FILENAME,
+        token=CFG.HF_TOKEN,
+    )
+    ckpt = torch.load(ckpt_path, map_location=CFG.DEVICE, weights_only=False)
+
+    backbone = ckpt.get("backbone", "convnext_small")
+    in_chans = ckpt.get("in_chans", 4)
+    target_cols = ckpt.get("target_cols", CFG.TARGET_COLS_DEFAULT)
+
+    model = NutritionNet(backbone, in_chans=in_chans, out_dim=len(target_cols))
+    model.load_state_dict(ckpt["model"])
+    model.to(CFG.DEVICE)
+    model.eval()
+
+    y_mean = np.array(ckpt["y_mean"], dtype=np.float32)
+    y_std  = np.array(ckpt["y_std"], dtype=np.float32)
+
+    return model, y_mean, y_std, target_cols
+
+
+def estimate_pseudo_depth(rgb_np):
+    """No physical depth sensor on a webcam -> heuristic pseudo-depth map.
+    (Reduces accuracy vs. true RGB-D but keeps the pipeline fully functional.)"""
+    gray = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    blur = cv2.GaussianBlur(gray, (21, 21), 0)
+    depth = 1.0 - (blur / 255.0)
+    depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
+    return depth.astype(np.float32)
+
+
+def preprocess_for_model(pil_img, img_size=CFG.IMG_SIZE):
+    rgb = np.array(pil_img.convert("RGB"))
+    depth = estimate_pseudo_depth(rgb)
+
+    h, w = rgb.shape[:2]
+    scale = img_size / max(h, w)
+    nh, nw = max(1, int(h * scale)), max(1, int(w * scale))
+    rgb_r = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    depth_r = cv2.resize(depth, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+    pad_h, pad_w = img_size - nh, img_size - nw
+    top, bottom = pad_h // 2, pad_h - pad_h // 2
+    left, right = pad_w // 2, pad_w - pad_w // 2
+
+    rgb_p = cv2.copyMakeBorder(rgb_r, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
+    depth_p = cv2.copyMakeBorder(depth_r, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
+
+    rgb_n = rgb_p.astype(np.float32) / 255.0
+    rgb_n = (rgb_n - IMAGENET_MEAN) / IMAGENET_STD
+    depth_n = (depth_p[..., None].astype(np.float32) - 0.5) / 0.25
+
+    img4 = np.concatenate([rgb_n, depth_n], axis=2).astype(np.float32)
+    x = torch.from_numpy(img4).permute(2, 0, 1).unsqueeze(0)
+    return x
+
+
+@torch.no_grad()
+def predict_nutrition(pil_img):
+    model, y_mean, y_std, target_cols = load_nutrition_model()
+    x = preprocess_for_model(pil_img).to(CFG.DEVICE)
+    pred = model(x).cpu().numpy()[0]
+    real = pred * y_std + y_mean
+    result = {col: max(0.0, float(v)) for col, v in zip(target_cols, real)}
+    return result
+
+
+# =====================================================================================
+# 4. HF INFERENCE CLIENT  (Chatbot + OCR + Speech-to-Text)
+# =====================================================================================
+SYSTEM_PROMPT = """You are an AI Nutrition Coach inside a live nutrition-tracking app.
+Help the user understand calories/macros, plan meals, and reach their goal
+(weight loss / muscle gain / maintenance). Use ONLY the nutrition data given to you
+in the "Trusted data" message — never invent numbers. Be concise, friendly, practical,
+never shame the user for any food choice, and never claim to be a doctor."""
+
+
+@st.cache_resource(show_spinner=False)
+def get_hf_client(model_id):
+    return InferenceClient(model=model_id, token=CFG.HF_TOKEN)
+
+
+def rule_based_fallback(user_msg, context):
+    msg = user_msg.lower()
+    remaining = context.get("remaining", {})
+    consumed = context.get("consumed", {})
+    if "calor" in msg and ("left" in msg or "remain" in msg):
+        return f"You have **{remaining.get('calories',0):.0f} kcal** left for today."
+    if "protein" in msg:
+        return f"Protein remaining: **{remaining.get('protein',0):.0f} g**."
+    if "carb" in msg:
+        return f"Carbs remaining: **{remaining.get('carbs',0):.0f} g**."
+    if "fat" in msg:
+        return f"Fat remaining: **{remaining.get('fat',0):.0f} g**."
+    if "eat" in msg and ("what" in msg or "suggest" in msg):
+        return "Check the 💡 Meal Suggestions tab — it's built from your exact remaining macros!"
+    return ("I'm running in offline mode right now (no HF_TOKEN detected / API busy). "
+            f"Quick snapshot — Consumed: {consumed.get('calories',0):.0f} kcal, "
+            f"Remaining: {remaining.get('calories',0):.0f} kcal.")
+
+
+def chat_with_ai(user_msg, context):
+    if not CFG.HF_TOKEN:
+        return rule_based_fallback(user_msg, context)
+    try:
+        client = get_hf_client(CFG.CHAT_MODEL)
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": f"Trusted data (JSON): {json.dumps(context)}"},
+        ]
+        for m in st.session_state.chat_history[-6:]:
+            messages.append(m)
+        messages.append({"role": "user", "content": user_msg})
+
+        resp = client.chat_completion(messages=messages, max_tokens=400, temperature=0.7)
+        return resp.choices[0].message.content
+    except Exception as e:
+        return rule_based_fallback(user_msg, context) + f"\n\n_(API error: {e})_"
+
+
+OCR_PROMPT = """Read this Nutrition Facts label and return STRICT JSON only, keys:
+product_name, serving_size, servings_per_container, calories, total_fat_g,
+saturated_fat_g, trans_fat_g, cholesterol_mg, sodium_mg, total_carbohydrates_g,
+dietary_fiber_g, total_sugars_g, added_sugars_g, protein_g.
+Use null for unreadable values. No markdown, JSON only."""
+
+EXPECTED_KEYS = ["product_name", "serving_size", "servings_per_container", "calories",
+                  "total_fat_g", "saturated_fat_g", "trans_fat_g", "cholesterol_mg",
+                  "sodium_mg", "total_carbohydrates_g", "dietary_fiber_g",
+                  "total_sugars_g", "added_sugars_g", "protein_g"]
+
+
+def parse_json_from_text(text):
+    m = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+    json_str = m.group(1) if m else text[text.find("{"): text.rfind("}") + 1]
+    try:
+        return json.loads(json_str)
+    except Exception:
+        return None
+
+
+def extract_nutrition_ocr(pil_img):
+    if not CFG.HF_TOKEN:
+        return None, "No HF_TOKEN set — add it in Streamlit secrets to enable AI OCR."
+    try:
+        client = get_hf_client(CFG.OCR_MODEL)
+        buf = io.BytesIO()
+        pil_img.convert("RGB").save(buf, format="JPEG")
+        b64 = base64.b64encode(buf.getvalue()).decode()
+
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": OCR_PROMPT},
+            ],
+        }]
+        resp = client.chat_completion(messages=messages, max_tokens=512, temperature=0.1)
+        raw = resp.choices[0].message.content
+        data = parse_json_from_text(raw)
+        if data is None:
+            return None, "Could not parse a valid JSON label from the model output."
+        clean = {k: data.get(k) for k in EXPECTED_KEYS}
+        return clean, None
+    except Exception as e:
+        return None, f"OCR API error: {e}"
+
+
+def transcribe_audio(audio_bytes):
+    if not CFG.HF_TOKEN:
+        return None
+    try:
+        client = get_hf_client(CFG.ASR_MODEL)
+        out = client.automatic_speech_recognition(audio_bytes)
+        return out.get("text") if isinstance(out, dict) else str(out)
+    except Exception:
+        return None
+
+
+def text_to_speech(text):
+    if not HAS_TTS:
+        return None
+    try:
+        tts = gTTS(text=text[:500], lang="en")
+        buf = io.BytesIO()
+        tts.write_to_fp(buf)
+        buf.seek(0)
+        return buf
+    except Exception:
+        return None
+
+
+# =====================================================================================
+# 5. NUTRITION TARGETS / SESSION STATE
+# =====================================================================================
+ACTIVITY_FACTORS = {"Sedentary": 1.2, "Light": 1.375, "Moderate": 1.55,
+                     "Active": 1.725, "Very Active": 1.9}
+
+FOOD_DB = [
+    {"name": "Grilled Chicken Breast", "calories": 165, "protein": 31, "carbs": 0, "fat": 3.6},
+    {"name": "Brown Rice (cooked)", "calories": 123, "protein": 2.7, "carbs": 25.6, "fat": 1.0},
+    {"name": "Salmon Fillet", "calories": 208, "protein": 20, "carbs": 0, "fat": 13},
+    {"name": "Avocado", "calories": 160, "protein": 2, "carbs": 9, "fat": 15},
+    {"name": "Greek Yogurt (plain)", "calories": 59, "protein": 10, "carbs": 3.6, "fat": 0.4},
+    {"name": "Oatmeal (cooked)", "calories": 68, "protein": 2.4, "carbs": 12, "fat": 1.4},
+    {"name": "Broccoli", "calories": 34, "protein": 2.8, "carbs": 7, "fat": 0.4},
+    {"name": "Sweet Potato", "calories": 86, "protein": 1.6, "carbs": 20, "fat": 0.1},
+    {"name": "Eggs (whole)", "calories": 155, "protein": 13, "carbs": 1.1, "fat": 11},
+    {"name": "Almonds", "calories": 579, "protein": 21, "carbs": 22, "fat": 50},
+    {"name": "Banana", "calories": 89, "protein": 1.1, "carbs": 23, "fat": 0.3},
+    {"name": "Whole Wheat Bread", "calories": 247, "protein": 13, "carbs": 41, "fat": 3.4},
+    {"name": "Peanut Butter", "calories": 588, "protein": 25, "carbs": 20, "fat": 50},
+    {"name": "Cottage Cheese", "calories": 98, "protein": 11, "carbs": 3.4, "fat": 4.3},
+    {"name": "Tofu", "calories": 76, "protein": 8, "carbs": 1.9, "fat": 4.8},
+    {"name": "Pizza (slice)", "calories": 266, "protein": 11, "carbs": 33, "fat": 10},
+    {"name": "Cheeseburger", "calories": 295, "protein": 17, "carbs": 30, "fat": 14},
+    {"name": "Chocolate Cake (slice)", "calories": 371, "protein": 5, "carbs": 51, "fat": 17},
+    {"name": "Apple", "calories": 52, "protein": 0.3, "carbs": 14, "fat": 0.2},
+    {"name": "Quinoa (cooked)", "calories": 120, "protein": 4.4, "carbs": 21, "fat": 1.9},
 ]
 
-NUM_PAT = r"(\d+[.,]?\d*)"
 
-OCR_PATTERNS = {
-    "calories":              rf"calories(?!\s*from)\D{{0,15}}{NUM_PAT}",
-    "total_fat_g":           rf"total\s*fat\D{{0,10}}{NUM_PAT}\s*g",
-    "saturated_fat_g":       rf"sat(?:urated)?\.?\s*fat\D{{0,10}}{NUM_PAT}\s*g",
-    "trans_fat_g":           rf"trans\s*fat\D{{0,10}}{NUM_PAT}\s*g",
-    "cholesterol_mg":        rf"cholesterol\D{{0,10}}{NUM_PAT}\s*mg",
-    "sodium_mg":             rf"sodium\D{{0,10}}{NUM_PAT}\s*mg",
-    "total_carbohydrates_g": rf"total\s*carb(?:ohydrate)?s?\D{{0,10}}{NUM_PAT}\s*g",
-    "dietary_fiber_g":       rf"(?:dietary\s*)?fib(?:er|re)\D{{0,10}}{NUM_PAT}\s*g",
-    "total_sugars_g":        rf"total\s*sugars\D{{0,10}}{NUM_PAT}\s*g|(?<!added\s)sugars\D{{0,10}}{NUM_PAT}\s*g",
-    "added_sugars_g":        rf"(?:incl\.?\s*)?added\s*sugars\D{{0,10}}{NUM_PAT}\s*g",
-    "protein_g":             rf"protein\D{{0,10}}{NUM_PAT}\s*g",
-}
+def init_state():
+    ss = st.session_state
+    ss.setdefault("profile", {"age": 28, "weight": 75.0, "height": 175.0,
+                               "sex": "Male", "activity": "Moderate", "goal": "Maintenance"})
+    ss.setdefault("targets", None)
+    ss.setdefault("meals", [])          # list of dicts
+    ss.setdefault("shopping_list", [])  # list of dicts {item, checked}
+    ss.setdefault("chat_history", [])   # list of {role, content}
+    ss.setdefault("last_scan", None)
+    ss.setdefault("last_ocr", None)
 
 
-def preprocess_for_ocr(pil_img: Image.Image) -> Image.Image:
-    """Upscale + denoise + threshold to dramatically improve Tesseract accuracy."""
-    if not HAS_CV2:
-        return pil_img.convert("L")
+def calculate_targets(profile):
+    w, h, age, sex = profile["weight"], profile["height"], profile["age"], profile["sex"]
+    bmr = 10 * w + 6.25 * h - 5 * age + (5 if sex == "Male" else -161)
+    tdee = bmr * ACTIVITY_FACTORS[profile["activity"]]
 
-    img = np.array(pil_img.convert("RGB"))
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-
-    # Upscale small images (helps OCR a lot)
-    h, w = gray.shape
-    if max(h, w) < 1500:
-        scale = 1500 / max(h, w)
-        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-    # Denoise
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
-
-    # Adaptive threshold (handles uneven lighting on photographed labels)
-    thresh = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 31, 15
-    )
-
-    # Deskew (best-effort, safe fallback if it fails)
-    try:
-        coords = np.column_stack(np.where(thresh < 255))
-        angle = cv2.minAreaRect(coords)[-1]
-        if angle < -45:
-            angle = -(90 + angle)
-        else:
-            angle = -angle
-        if abs(angle) > 0.5:
-            (h2, w2) = thresh.shape
-            M = cv2.getRotationMatrix2D((w2 // 2, h2 // 2), angle, 1.0)
-            thresh = cv2.warpAffine(thresh, M, (w2, h2),
-                                     flags=cv2.INTER_CUBIC,
-                                     borderMode=cv2.BORDER_REPLICATE)
-    except Exception:
-        pass
-
-    return Image.fromarray(thresh)
-
-
-def normalize_ocr_text(text: str) -> str:
-    t = text.lower()
-    t = t.replace("\n", " ")
-    t = re.sub(r"\s+", " ", t)
-    # common OCR confusions inside numbers
-    t = re.sub(r"(?<=\d)o(?=\d|\s|g|mg)", "0", t)   # "1o0" -> "100"
-    t = re.sub(r"(?<=\d)l(?=\s|g|mg)", "1", t)      # "10l" -> "101" (rare)
-    t = t.replace(",", ".")                          # "1,200" thousand sep -> careful
-    t = t.replace("º", "0").replace("O%", "0%")
-    return t
-
-
-def run_ocr_multi(pil_img: Image.Image) -> str:
-    """Try a few PSM modes and keep whichever finds the most nutrition keywords."""
-    if not TESS_OK:
-        return ""
-
-    processed = preprocess_for_ocr(pil_img)
-    candidates = []
-    for psm in [6, 4, 11, 3]:
-        try:
-            config = f"--psm {psm}"
-            txt = pytesseract.image_to_string(processed, config=config)
-            candidates.append(txt)
-        except Exception:
-            continue
-    if not candidates:
-        try:
-            return pytesseract.image_to_string(pil_img)
-        except Exception:
-            return ""
-
-    keywords = ["calories", "fat", "sodium", "carbohydrate", "protein", "sugar"]
-
-    def score(t):
-        low = t.lower()
-        return sum(low.count(k) for k in keywords)
-
-    return max(candidates, key=score)
-
-
-def extract_nutrition_ocr(pil_img: Image.Image):
-    if not TESS_OK:
-        return None, "Tesseract is not available on this server (check packages.txt)."
-
-    raw_text = run_ocr_multi(pil_img)
-    norm = normalize_ocr_text(raw_text)
-
-    result = {"product_name": None, "serving_size": None, "servings_per_container": None}
-
-    for key, pattern in OCR_PATTERNS.items():
-        m = re.search(pattern, norm)
-        if m:
-            val = next(g for g in m.groups() if g)  # first non-None captured group
-            try:
-                result[key] = float(val.replace(",", "."))
-            except ValueError:
-                result[key] = None
-        else:
-            result[key] = None
-
-    sm = re.search(r"serving size\D{0,25}([\d./]+\s*\w*\s*\(?\d*\s*g?\)?)", norm)
-    if sm:
-        result["serving_size"] = sm.group(1).strip()
-
-    spc = re.search(r"servings?\s*per\s*container\D{0,10}(\d+)", norm)
-    if spc:
-        result["servings_per_container"] = float(spc.group(1))
-
-    result["raw_text"] = raw_text
-    found_count = sum(1 for k in EXPECTED_KEYS if k not in ("product_name", "serving_size", "servings_per_container")
-                       and result.get(k) is not None)
-
-    if found_count == 0:
-        return result, ("⚠️ Could not confidently detect any nutrition values. "
-                         "Try a sharper, well-lit, straight-on photo of the label, "
-                         "or fill values manually below.")
-    return result, None
-
-# =========================================================
-# 🧭 AI ROUTER + CHATBOT
-# =========================================================
-@dataclass
-class Route:
-    intent: str
-    tool: Optional[str]
-    confidence: float
-    arguments: Dict[str, Any] = field(default_factory=dict)
-
-class AIRouter:
-    def __init__(self):
-        self.rules = {
-            "daily_summary": [r"how many calories.*(left|remaining)", r"calories.*(left|remaining)", r"what did i eat today", r"daily.*summary"],
-            "remaining_macros": [r"how much protein.*(left|remaining)", r"remaining.*(protein|carb|fat|macro)"],
-            "portion_calculation": [r"how much.*can i eat", r"how many grams", r"what portion"],
-            "food_logging": [r"i ate", r"log this", r"add this"],
-            "recommendation": [r"what should i eat", r"recommend.*meal", r"what.*eat.*dinner"],
-            "food_comparison": [r"compare", r"which.*better"],
-            "user_targets": [r"my calorie target", r"my macros", r"what.*my.*target"],
-            "food_history": [r"food history", r"what.*ate.*yesterday", r"show.*my meals"],
-        }
-        self.tool_map = {
-            "daily_summary": "get_daily_summary", "remaining_macros": "get_remaining_macros",
-            "portion_calculation": "calculate_food_portion", "food_logging": "log_food",
-            "recommendation": "recommend_meals", "food_comparison": "compare_foods",
-            "user_targets": "get_user_targets", "food_history": "get_food_history",
-        }
-
-    def route(self, message: str) -> Route:
-        text = re.sub(r"\s+", " ", message.lower().strip())
-        scores = {intent: sum(bool(re.search(p, text)) for p in pats) for intent, pats in self.rules.items()}
-        best = max(scores, key=scores.get)
-        if scores[best] == 0:
-            return Route("general_nutrition_chat", None, 0.25)
-        return Route(best, self.tool_map[best], min(0.95, 0.55 + scores[best] * 0.15))
-
-router = AIRouter()
-
-def generate_coach_response(user_msg):
-    totals = get_totals()
-    target = st.session_state.daily_target or calculate_goals(2000, 70, "Maintenance")
-    remaining = {k: target[k] - totals.get(k, 0) for k in ["calories", "protein", "carb", "fat"]}
-    route = router.route(user_msg)
-    ctx = f"Today eaten: {totals}, Target: {target}, Remaining: {remaining}, Meals: {len(get_today_meals())}"
-
-    if route.intent == "daily_summary":
-        return (f"**Today's Summary** 📊\n\nYou have eaten {len(get_today_meals())} meals.\n\n"
-                f"- Calories: {totals['calories']:.0f}/{target['calories']} (remaining {remaining['calories']:.0f})\n"
-                f"- Protein: {totals['protein']:.0f}g / {target['protein']}g (remaining {remaining['protein']:.0f}g)\n"
-                f"- Carbs: {totals['carb']:.0f}g / {target['carb']}g\n- Fat: {totals['fat']:.0f}g / {target['fat']}g\n\n"
-                f"You're doing great! Keep it balanced.")
-
-    if route.intent == "remaining_macros":
-        return (f"You have **{remaining['calories']:.0f} kcal** left today.\n\n"
-                f"- Protein: {remaining['protein']:.0f}g\n- Carbs: {remaining['carb']:.0f}g\n- Fat: {remaining['fat']:.0f}g\n\n"
-                f"Want a meal suggestion to fill it?")
-
-    if route.intent == "recommendation":
-        if remaining['protein'] > 20:
-            return (f"With {remaining['calories']:.0f} kcal left and {remaining['protein']:.0f}g protein needed, try:\n"
-                    f"- **Grilled Chicken + Rice + Salad** (~400 kcal, 35g protein)\n"
-                    f"- Greek Yogurt with fruits (~150 kcal)\n- Salmon Bowl (~350 kcal, 22g protein)")
-        return f"Light option with {remaining['calories']:.0f} kcal left: **Vegetable Salad + Olive oil** or **Apple + Peanut Butter**."
-
-    if route.intent == "portion_calculation":
-        return (f"Tell me the food and I can calculate portion! You have {remaining['calories']:.0f} kcal remaining. "
-                f"For example, chocolate cake is ~371 kcal/100g, so you could have about "
-                f"{max(0, remaining['calories']/371*100):.0f}g.")
-
-    if route.intent == "user_targets":
-        return (f"Your daily targets ({st.session_state.user_profile['goal']}):\n"
-                f"- {target['calories']} kcal\n- Protein {target['protein']}g\n- Carbs {target['carb']}g\n- Fat {target['fat']}g")
-
-    if route.intent == "food_comparison":  # 🔧 now handled instead of falling through
-        return ("Head to the **🛒 Smart Shopping** tab — pick two foods there and I'll compare "
-                "calories, protein, fat, and sugar side by side, then tell you which is the better choice.")
-
-    if route.intent == "food_history":  # 🔧 now handled
-        meals = get_today_meals()
-        if not meals:
-            return "You haven't logged any meals today yet. Scan a meal in **📷 Live Scanner** to get started!"
-        lines = "\n".join([f"- {m['time']} — {m['name']} ({m['nutrition']['calories']:.0f} kcal)" for m in meals])
-        return f"**Today's food history:**\n\n{lines}"
-
-    if route.intent == "food_logging":  # 🔧 now handled
-        return ("I can't log meals from chat text yet — please use **📷 Live Scanner** to snap a photo, "
-                "or **🏷️ Label Scanner** to scan a packaged product, and I'll add it to your log automatically.")
-
-    # General LLM fallback (optional OpenAI key)
-    try:
-        if "OPENAI_API_KEY" in st.secrets:
-            from openai import OpenAI
-            client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": f"You are an AI Nutrition Coach. Data: {ctx}. Be concise, friendly, no shaming."},
-                    {"role": "user", "content": user_msg}
-                ], max_tokens=300
-            )
-            return resp.choices[0].message.content
-    except Exception:
-        pass
-
-    return (f"I'm your AI Nutrition Coach 🥗\n\n{ctx}\n\nYou asked: '{user_msg}'\n\n"
-            f"Tips: Focus on whole foods, balance your remaining macros, and enjoy food without guilt. "
-            f"What would you like to log or know about your meals?")
-
-# =========================================================
-# 👤 SIDEBAR — PROFILE & TARGETS
-# =========================================================
-with st.sidebar:
-    st.title("👤 Your Profile")
-    p = st.session_state.user_profile
-    p["age"] = st.number_input("Age", 10, 90, p["age"])
-    p["sex"] = st.selectbox("Sex", ["Male", "Female"], index=0 if p["sex"] == "Male" else 1)
-    p["weight"] = st.number_input("Weight (kg)", 30.0, 200.0, float(p["weight"]))
-    p["height"] = st.number_input("Height (cm)", 100.0, 230.0, float(p["height"]))
-    p["activity"] = st.selectbox("Activity", ["Sedentary", "Light", "Moderate", "Active", "Very Active"], index=2)
-    p["goal"] = st.selectbox("Goal", ["Weight Loss", "Maintenance", "Muscle Gain"],
-                              index=["Weight Loss", "Maintenance", "Muscle Gain"].index(p["goal"]))
-
-    bmr = calculate_bmr(p["weight"], p["height"], p["age"], p["sex"])
-    tdee = calculate_tdee(bmr, p["activity"])
-    target = calculate_goals(tdee, p["weight"], p["goal"])
-    st.session_state.daily_target = target
-
-    st.divider()
-    st.markdown(f"""
-    <div class="food-card" style="padding:14px;">
-        <p class="kpi-label">🔥 TDEE</p>
-        <p class="kpi-value" style="color:#2e7d32;">{tdee:.0f} kcal/day</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("**🎯 Daily Targets**")
-    st.markdown(f"""
-    <span class="macro-badge" style="background:#e8f5e9;">🔥 {target['calories']} kcal</span>
-    <span class="macro-badge" style="background:#e3f2fd;">💪 {target['protein']}g P</span>
-    <span class="macro-badge" style="background:#fff3e0;">🍞 {target['carb']}g C</span>
-    <span class="macro-badge" style="background:#ffebee;">🥑 {target['fat']}g F</span>
-    """, unsafe_allow_html=True)
-
-    st.divider()
-    if st.button("🗑️ Clear Today's Log", use_container_width=True):
-        st.session_state.meals = [m for m in st.session_state.meals if m["date"] != date.today().isoformat()]
-        st.toast("Today's log cleared!", icon="🗑️")
-        st.rerun()
-
-# =========================================================
-# 🎬 MAIN HEADER
-# =========================================================
-st.markdown("""
-<div class="hero-header">
-    <h1>🥗 Live AI Nutrition & Smart Shopping Assistant</h1>
-    <p>Live camera • Nutrition5k model • OCR Label Scanner • AI Coach • Smart Shopping</p>
-</div>
-""", unsafe_allow_html=True)
-
-# Load models (cached, lazy)
-nutrition_model_data = load_nutrition_model()
-food_classifier = load_food_classifier()
-
-totals = get_totals()
-remaining = {k: target[k] - totals.get(k, 0) for k in ["calories", "protein", "carb", "fat"]}
-
-# =========================================================
-# 📊 ANIMATED KPI ROW
-# =========================================================
-def kpi_card(icon, label, value, unit, sub, color):
-    st.markdown(f"""
-    <div class="kpi-card">
-        <p class="kpi-label">{icon} {label}</p>
-        <p class="kpi-value" style="color:{color};">{value:.0f}{unit}</p>
-        <p class="kpi-sub">{sub}</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-k1, k2, k3, k4 = st.columns(4)
-with k1: kpi_card("🔥", "Calories Left", remaining["calories"], " kcal", f"{totals['calories']:.0f} eaten", "#e53935")
-with k2: kpi_card("💪", "Protein Left", remaining["protein"], " g", f"{totals['protein']:.0f}g eaten", "#1e88e5")
-with k3: kpi_card("🍞", "Carbs Left", remaining["carb"], " g", f"{totals['carb']:.0f}g eaten", "#fb8c00")
-with k4: kpi_card("🥑", "Fat Left", remaining["fat"], " g", f"{totals['fat']:.0f}g eaten", "#43a047")
-
-st.write("")  # spacing
-
-tabs = st.tabs(["📷 Live Scanner", "🏷️ Label Scanner", "📊 Dashboard", "🤖 AI Coach", "🛒 Smart Shopping"])
-
-# =========================================================
-# 📷 TAB 1 — LIVE SCANNER
-# =========================================================
-with tabs[0]:
-    colA, colB = st.columns([1, 1])
-    with colA:
-        st.markdown('<span class="pulse-dot"></span> **Live Camera Food Recognition**', unsafe_allow_html=True)
-        st.caption("Point your camera at your meal — the AI estimates calories & macros instantly.")
-        cam = st.camera_input("Take a picture of your meal")
-        upl = st.file_uploader("Or upload food image", type=["jpg", "png", "jpeg"], key="food_up")
-        img_file = cam if cam else upl
-        portion = st.slider("Portion size (grams)", 50, 800, 350, step=10)
-
-    with colB:
-        if img_file:
-            pil_img = Image.open(img_file).convert("RGB")
-            st.image(pil_img, caption="Captured Meal", use_container_width=True)
-
-            with st.spinner("🔍 Analyzing with Vision models..."):
-                est = predict_with_rgbd_model(pil_img, nutrition_model_data)
-                clf_label = "salad"
-                clf_conf = 0.0
-                if food_classifier:
-                    try:
-                        res = food_classifier(pil_img)
-                        clf_label = res[0]["label"]
-                        clf_conf = res[0]["score"]
-                        st.info(f"Classifier: **{clf_label}** ({clf_conf:.1%})")
-                    except Exception as e:
-                        st.warning(f"Classifier error: {e}")
-
-                if est is None:
-                    est = estimate_from_food_db(clf_label, portion)
-                else:
-                    scale = portion / max(est["mass"], 1)
-                    for k in ["calories", "protein", "fat", "carb"]:
-                        est[k] = round(est[k] * scale, 1)
-                    est["mass"] = portion
-                    est["name"] = f"{clf_label.title()} ({est['name']})"
-
-                st.markdown(f"""
-                <div class="food-card">
-                    <h3>{est['name']} — {est['mass']:.0f}g</h3>
-                    <span class="macro-badge" style="background:#e8f5e9">🌾 Carbs: {est['carb']}g</span>
-                    <span class="macro-badge" style="background:#fff3e0">💧 Fat: {est['fat']}g</span>
-                    <span class="macro-badge" style="background:#ffebee">🍬 Sugar: {est.get('sugar',0)}g</span>
-                    <h2 style="margin-top:15px">{est['calories']:.0f} kcal | P:{est['protein']}g C:{est['carb']}g F:{est['fat']}g</h2>
-                </div>
-                """, unsafe_allow_html=True)
-
-                fig = go.Figure(data=[go.Pie(
-                    labels=["Rice", "Salmon", "Cucumber", "Spinach", "Lettuce", "Sesame"],
-                    values=[42.9, 28.6, 14.3, 4.4, 4.2, 5.7], hole=0.6
-                )])
-                fig.update_layout(height=280, margin=dict(l=0, r=0, t=0, b=0), showlegend=False,
-                                   transition_duration=500)
-                st.plotly_chart(fig, use_container_width=True)
-
-                if st.button("➕ Add to Today's Log", type="primary", use_container_width=True):
-                    st.session_state.meals.append({
-                        "id": len(st.session_state.meals),
-                        "date": date.today().isoformat(),
-                        "time": datetime.now().strftime("%H:%M"),
-                        "name": est["name"],
-                        "nutrition": est,
-                    })
-                    st.toast(f"Added {est['name']}!", icon="✅")
-                    st.balloons()
-        else:
-            model_status = "Nutrition5k ConvNeXt ✅" if nutrition_model_data[0] else "FOOD-DB Demo Mode"
-            st.info(f"📸 Start camera to scan your meal. Model: **{model_status}**")
-
-# =========================================================
-# 🏷️ TAB 2 — LABEL SCANNER (fixed nested-button bug)
-# =========================================================
-with tabs[1]:
-    st.subheader("🏷️ Nutrition Facts Label Detection + OCR")
-
-    if not TESS_OK:
-        st.warning("⚠️ `pytesseract` is not available on this server. Add `pytesseract` to "
-                    "`requirements.txt` and `tesseract-ocr` to `packages.txt`. You can still enter "
-                    "values manually below after uploading a photo.")
+    goal = profile["goal"]
+    if goal == "Weight Loss":
+        calories = tdee - 500
+        protein_g = w * 2.2
+    elif goal == "Muscle Gain":
+        calories = tdee + 400
+        protein_g = w * 2.0
     else:
-        st.caption("OCR engine active: **pytesseract** (multi-PSM + auto-deskew preprocessing)")
+        calories = tdee
+        protein_g = w * 1.8
 
-    col1, col2 = st.columns(2)
+    calories = max(calories, 1200)
+    protein_cal = protein_g * 4
+    fat_cal = calories * 0.25
+    fat_g = fat_cal / 9
+    carb_g = max(calories - protein_cal - fat_cal, 0) / 4
+
+    return {"calories": round(calories), "protein": round(protein_g),
+            "fat": round(fat_g), "carbs": round(carb_g)}
+
+
+def today_meals():
+    today = date.today().isoformat()
+    return [m for m in st.session_state.meals if m["date"] == today]
+
+
+def consumed_today():
+    meals = today_meals()
+    return {
+        "calories": sum(m["calories"] for m in meals),
+        "protein": sum(m["protein"] for m in meals),
+        "carbs": sum(m["carbs"] for m in meals),
+        "fat": sum(m["fat"] for m in meals),
+    }
+
+
+def remaining_today():
+    t = st.session_state.targets or calculate_targets(st.session_state.profile)
+    c = consumed_today()
+    return {k: round(t[k] - c[k], 1) for k in t}
+
+
+def add_meal(name, calories, protein, carbs, fat, mass=None, source="manual"):
+    st.session_state.meals.append({
+        "date": date.today().isoformat(),
+        "time": datetime.now().strftime("%H:%M"),
+        "name": name,
+        "calories": round(calories, 1),
+        "protein": round(protein, 1),
+        "carbs": round(carbs, 1),
+        "fat": round(fat, 1),
+        "mass": round(mass, 1) if mass else None,
+        "source": source,
+    })
+
+
+# =====================================================================================
+# 6. UI PAGES
+# =====================================================================================
+def render_hero(title, subtitle):
+    st.markdown(f"""
+    <div class="hero">
+        <h1>{title}</h1>
+        <p>{subtitle}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def macro_pill(label, value, unit, color):
+    st.markdown(f"""
+    <div class="macro-pill" style="background:{color};">
+        <div style="font-size:0.85rem; opacity:0.9;">{label}</div>
+        <div style="font-size:1.5rem; font-weight:800;">{value}{unit}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def page_dashboard():
+    render_hero("Let's Check Your Nutrition Today 🌿",
+                "Live overview of calories, macros, and today's meals.")
+
+    if st.session_state.targets is None:
+        st.session_state.targets = calculate_targets(st.session_state.profile)
+
+    targets = st.session_state.targets
+    consumed = consumed_today()
+    remaining = remaining_today()
+
+    col1, col2 = st.columns([1.1, 1])
     with col1:
-        cam2 = st.camera_input("Photograph Nutrition Facts table", key="label_cam")
-        upl2 = st.file_uploader("Upload label image", type=["jpg", "jpeg", "png"], key="label_up")
-        img2_file = cam2 if cam2 else upl2
-        st.caption("💡 Tip: flat label, good light, fill the frame, avoid glare/blur.")
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=consumed["calories"],
+            number={"suffix": " kcal"},
+            title={"text": "Calories Consumed Today"},
+            gauge={
+                "axis": {"range": [0, max(targets["calories"] * 1.3, 500)]},
+                "bar": {"color": "#2e7d32"},
+                "steps": [
+                    {"range": [0, targets["calories"]], "color": "#e8f5e9"},
+                    {"range": [targets["calories"], targets["calories"] * 1.3], "color": "#ffe0e0"},
+                ],
+                "threshold": {"line": {"color": "red", "width": 4},
+                              "thickness": 0.8, "value": targets["calories"]},
+            },
+        ))
+        fig.update_layout(height=300, margin=dict(t=40, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
     with col2:
-        if img2_file:
-            pil2 = Image.open(img2_file).convert("RGB")
-            st.image(pil2, caption="Label Image", use_container_width=True)
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("🎯 Remaining Today")
+        c1, c2 = st.columns(2)
+        with c1:
+            macro_pill("Calories left", f"{remaining['calories']:.0f}", " kcal", "#2e7d32")
+            st.write("")
+            macro_pill("Protein left", f"{remaining['protein']:.0f}", " g", "#ef6c00")
+        with c2:
+            macro_pill("Carbs left", f"{remaining['carbs']:.0f}", " g", "#1565c0")
+            st.write("")
+            macro_pill("Fat left", f"{remaining['fat']:.0f}", " g", "#c2185b")
+        st.markdown('</div>', unsafe_allow_html=True)
 
-            if st.button("🔍 Extract with OCR", type="primary", use_container_width=True):
-                with st.spinner("Running OCR..."):
-                    parsed, warn = extract_nutrition_ocr(pil2)
-                st.session_state["last_label"] = parsed
-                st.session_state["last_label_raw"] = parsed.get("raw_text", "") if parsed else ""
-                st.session_state["last_label_warn"] = warn
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("📊 Macro Progress")
+    for label, key, color in [("Protein", "protein", "#ef6c00"),
+                               ("Carbs", "carbs", "#1565c0"),
+                               ("Fat", "fat", "#c2185b")]:
+        frac = min(consumed[key] / targets[key], 1.0) if targets[key] else 0
+        st.write(f"**{label}** — {consumed[key]:.0f} / {targets[key]:.0f} g")
+        st.progress(frac)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("🍽️ Today's Meals")
+    meals = today_meals()
+    if meals:
+        st.dataframe(pd.DataFrame(meals)[["time", "name", "calories", "protein", "carbs", "fat", "source"]],
+                     use_container_width=True, hide_index=True)
+    else:
+        st.info("No meals logged yet today — scan a food or a label to get started!")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def page_live_scanner():
+    render_hero("📸 Live Food Scanner", "Point your camera at a meal to estimate calories & macros.")
+
+    lottie = load_lottie("https://assets9.lottiefiles.com/packages/lf20_M9p23l.json")
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        img_file = st.camera_input("Take a photo of your food")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with col2:
+        if img_file is not None:
+            pil_img = Image.open(img_file)
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            if lottie and HAS_LOTTIE:
+                with st.spinner(""):
+                    st_lottie(lottie, height=120, key="scan_anim")
+            with st.spinner("🔍 Analyzing food with AI model..."):
+                try:
+                    result = predict_nutrition(pil_img)
+                    st.session_state.last_scan = result
+                except Exception as e:
+                    st.error(f"Model inference failed: {e}")
+                    result = None
+
+            if result:
+                st.success("Analysis complete!")
+                st.metric("Estimated mass (g)", f"{result['total_mass']:.0f}")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Calories", f"{result['total_calories']:.0f} kcal")
+                c2.metric("Protein", f"{result['total_protein']:.1f} g")
+                c3.metric("Carbs", f"{result['total_carb']:.1f} g")
+                c4.metric("Fat", f"{result['total_fat']:.1f} g")
+
+                food_name = st.text_input("Meal name", value="Scanned Meal")
+                if st.button("➕ Add to Meal Log", key="add_scan"):
+                    add_meal(food_name, result["total_calories"], result["total_protein"],
+                              result["total_carb"], result["total_fat"],
+                              mass=result["total_mass"], source="camera_ai")
+                    st.success(f"Added '{food_name}' to today's log!")
+            st.markdown('</div>', unsafe_allow_html=True)
         else:
-            st.info("Take a photo of the Nutrition Facts table — OCR extracts calories, fat, carbs, sugar, etc.")
+            st.info("Waiting for a photo... 📷")
 
-    # ---- Persistent results block (fixes the nested-button issue) ----
-    if st.session_state.get("last_label") is not None:
-        parsed = st.session_state["last_label"]
-        warn = st.session_state.get("last_label_warn")
 
-        st.markdown("---")
-        if warn:
-            st.warning(warn)
+def page_label_scanner():
+    render_hero("🧾 Nutrition Label Scanner", "Scan a packaged product's Nutrition Facts table.")
 
-        st.markdown("#### 📋 Extracted Values — review & correct if needed")
+    tab1, tab2 = st.tabs(["📷 Use Camera", "📁 Upload Image"])
+    img = None
+    with tab1:
+        cam = st.camera_input("Capture the nutrition label", key="label_cam")
+        if cam:
+            img = Image.open(cam)
+    with tab2:
+        up = st.file_uploader("Upload a label photo", type=["jpg", "jpeg", "png"])
+        if up:
+            img = Image.open(up)
 
-        with st.expander("🔍 Debug: Raw OCR Text"):
-            st.text(st.session_state.get("last_label_raw") or "No text captured.")
+    if img is not None:
+        st.image(img, caption="Captured Label", width=320)
+        if st.button("🔍 Extract Nutrition Data"):
+            with st.spinner("Reading label with AI Vision..."):
+                data, err = extract_nutrition_ocr(img)
+            if err:
+                st.error(err)
+            else:
+                st.session_state.last_ocr = data
+                st.success("Label parsed successfully!")
 
-        numeric_fields = [k for k in EXPECTED_KEYS if k not in ("product_name", "serving_size", "servings_per_container")]
-        edit_df = pd.DataFrame({"Nutrient": numeric_fields, "Value": [parsed.get(f) for f in numeric_fields]})
-        edited = st.data_editor(edit_df, use_container_width=True, num_rows="fixed", key="label_editor")
+    if st.session_state.last_ocr:
+        data = st.session_state.last_ocr
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        df = pd.DataFrame(list(data.items()), columns=["Nutrient", "Value"])
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
-        cc1, cc2, cc3 = st.columns(3)
-        with cc1:
-            prod_name = st.text_input("Product name for log", value=parsed.get("product_name") or "Packaged Product (OCR)")
-        with cc2:
-            serving_size = st.text_input("Serving size", value=parsed.get("serving_size") or "")
-        with cc3:
-            grams_basis = st.number_input("Values are per how many grams?", min_value=1, value=100, step=10)
+        name = st.text_input("Product name to log", value=data.get("product_name") or "Packaged Food")
+        if st.button("➕ Add to Meal Log", key="add_ocr"):
+            add_meal(
+                name,
+                float(data.get("calories") or 0),
+                float(data.get("protein_g") or 0),
+                float(data.get("total_carbohydrates_g") or 0),
+                float(data.get("total_fat_g") or 0),
+                source="label_ocr",
+            )
+            st.success(f"Added '{name}' to today's log!")
+        st.markdown('</div>', unsafe_allow_html=True)
 
-        if st.button("➕ Add Label as Meal", use_container_width=True):
-            vals = dict(zip(edited["Nutrient"], edited["Value"]))
-            nutrition = {
-                "calories": vals.get("calories") or 0,
-                "fat": vals.get("total_fat_g") or 0,
-                "protein": vals.get("protein_g") or 0,
-                "carb": vals.get("total_carbohydrates_g") or 0,
-                "fiber": vals.get("dietary_fiber_g") or 0,
-                "sugar": vals.get("total_sugars_g") or 0,
-                "mass": grams_basis,
-                "name": prod_name
-            }
-            st.session_state.meals.append({
-                "id": len(st.session_state.meals),
-                "date": date.today().isoformat(),
-                "time": datetime.now().strftime("%H:%M"),
-                "name": nutrition["name"],
-                "nutrition": nutrition
-            })
-            st.toast(f"Added {prod_name}!", icon="✅")
-            st.balloons()
-            st.session_state["last_label"] = None
-            st.session_state["last_label_raw"] = ""
-            st.session_state["last_label_warn"] = None
-            st.rerun()
 
-# =========================================================
-# 📊 TAB 3 — DASHBOARD
-# =========================================================
-with tabs[2]:
-    st.subheader("📊 Live Web Dashboard — Daily Progress")
-    left, right = st.columns([1, 2])
+def page_meal_log():
+    render_hero("📒 Meal Log", "Review, manage, and export everything you've eaten.")
 
-    with left:
-        totals = get_totals()
-        fig = go.Figure(data=[go.Pie(
-            labels=["Eaten", "Remaining"],
-            values=[max(totals["calories"], 0), max(target["calories"] - totals["calories"], 0)],
-            hole=0.7, marker_colors=["#66bb6a", "#e0e0e0"]
-        )])
-        fig.update_layout(title=f"Calories {totals['calories']:.0f}/{target['calories']}",
-                           height=260, margin=dict(t=40, b=0, l=0, r=0), transition_duration=500)
-        st.plotly_chart(fig, use_container_width=True)
+    meals = st.session_state.meals
+    if not meals:
+        st.info("No meals logged yet.")
+        return
 
-        for macro, color in [("protein", "#1e88e5"), ("carb", "#fb8c00"), ("fat", "#43a047")]:
-            pct = min(totals[macro] / target[macro], 1.0) if target[macro] > 0 else 0
-            st.markdown(f"**{macro.title()}** — {totals[macro]:.0f}/{target[macro]}g")
+    df = pd.DataFrame(meals)
+    dates = sorted(df["date"].unique(), reverse=True)
+    sel_date = st.selectbox("Filter by date", dates, index=0)
+    view = df[df["date"] == sel_date].reset_index(drop=True)
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.dataframe(view, use_container_width=True, hide_index=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Calories", f"{view['calories'].sum():.0f}")
+    c2.metric("Total Protein", f"{view['protein'].sum():.0f} g")
+    c3.metric("Total Carbs", f"{view['carbs'].sum():.0f} g")
+    c4.metric("Total Fat", f"{view['fat'].sum():.0f} g")
+
+    csv = df.to_csv(index=False).encode()
+    st.download_button("⬇️ Export Full Log (CSV)", csv, "meal_log.csv", "text/csv")
+
+    del_idx = st.number_input("Row index to delete (from full log)", min_value=0,
+                               max_value=max(len(df) - 1, 0), step=1)
+    if st.button("🗑️ Delete Row"):
+        st.session_state.meals.pop(del_idx)
+        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def page_goals():
+    render_hero("🎯 Goals & Daily Targets", "Tell us about yourself to personalize your targets.")
+
+    p = st.session_state.profile
+    with st.form("profile_form"):
+        c1, c2, c3 = st.columns(3)
+        age = c1.number_input("Age", 10, 100, p["age"])
+        weight = c2.number_input("Weight (kg)", 30.0, 250.0, p["weight"])
+        height = c3.number_input("Height (cm)", 100.0, 230.0, p["height"])
+
+        c4, c5, c6 = st.columns(3)
+        sex = c4.selectbox("Sex", ["Male", "Female"], index=["Male", "Female"].index(p["sex"]))
+        activity = c5.selectbox("Activity Level", list(ACTIVITY_FACTORS.keys()),
+                                 index=list(ACTIVITY_FACTORS.keys()).index(p["activity"]))
+        goal = c6.selectbox("Goal", ["Weight Loss", "Maintenance", "Muscle Gain"],
+                             index=["Weight Loss", "Maintenance", "Muscle Gain"].index(p["goal"]))
+
+        submitted = st.form_submit_button("💾 Save & Recalculate")
+
+    if submitted:
+        st.session_state.profile = {"age": age, "weight": weight, "height": height,
+                                     "sex": sex, "activity": activity, "goal": goal}
+        st.session_state.targets = calculate_targets(st.session_state.profile)
+        st.success("Targets updated!")
+
+    targets = st.session_state.targets or calculate_targets(p)
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("Your Daily Targets")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Calories", f"{targets['calories']} kcal")
+    c2.metric("Protein", f"{targets['protein']} g")
+    c3.metric("Carbs", f"{targets['carbs']} g")
+    c4.metric("Fat", f"{targets['fat']} g")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def page_suggestions():
+    render_hero("💡 Smart Meal Suggestions", "Based on your remaining calories & macros right now.")
+
+    remaining = remaining_today()
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.write(f"Remaining today → **{remaining['calories']:.0f} kcal**, "
+             f"**{remaining['protein']:.0f}g protein**, "
+             f"**{remaining['carbs']:.0f}g carbs**, **{remaining['fat']:.0f}g fat**")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if remaining["calories"] <= 0:
+        st.warning("You've hit your calorie target for today — great job! 🎉")
+        return
+
+    suggestions = []
+    for f in FOOD_DB:
+        if f["calories"] <= 0:
+            continue
+        portion = min((remaining["calories"] / f["calories"]) * 100, 250)
+        if portion < 20:
+            continue
+        scaled = {k: (round(v * portion / 100, 1) if k != "name" else v) for k, v in f.items()}
+        scaled["portion_g"] = round(portion)
+        suggestions.append(scaled)
+    suggestions.sort(key=lambda x: -x["protein"])
+
+    cols = st.columns(3)
+    for i, s in enumerate(suggestions[:9]):
+        with cols[i % 3]:
             st.markdown(f"""
-            <div class="progress-wrap">
-                <div class="progress-fill" style="width:{pct*100}%; background: linear-gradient(90deg,{color}99,{color});"></div>
+            <div class="card">
+                <h4>🍲 {s['name']}</h4>
+                <span class="metric-badge">{s['portion_g']} g portion</span>
+                <p style="margin-top:10px;">
+                🔥 {s['calories']} kcal &nbsp;|&nbsp; 🥩 {s['protein']}g P<br>
+                🍞 {s['carbs']}g C &nbsp;|&nbsp; 🥑 {s['fat']}g F
+                </p>
             </div>
             """, unsafe_allow_html=True)
+            if st.button(f"Add {s['name']}", key=f"sugg_{i}"):
+                add_meal(s["name"], s["calories"], s["protein"], s["carbs"], s["fat"],
+                          mass=s["portion_g"], source="suggestion")
+                st.success(f"Added {s['name']}!")
 
-    with right:
-        meals_today = get_today_meals()
-        if meals_today:
-            df = pd.DataFrame([{
-                "Time": m["time"], "Food": m["name"], "kcal": m["nutrition"]["calories"],
-                "P": m["nutrition"]["protein"], "C": m["nutrition"]["carb"], "F": m["nutrition"]["fat"]
-            } for m in meals_today])
-            st.dataframe(df, use_container_width=True)
-            fig2 = px.bar(df, x="Food", y=["P", "C", "F"], barmode="group", title="Macros by Meal")
-            fig2.update_layout(transition_duration=500)
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.info("No meals logged yet. Go to **📷 Live Scanner**!")
 
-    st.divider()
-    st.subheader("💡 Meal Suggestions based on Remaining Macros")
-    rem = remaining
-    suggestions = []
-    if rem["protein"] > 20: suggestions.append("🔥 High Protein: Grilled Chicken 200g + Rice 100g (380 kcal, 42g P)")
-    if rem["carb"] < 50: suggestions.append("🥑 Low Carb: Avocado + Eggs (250 kcal, 15g C)")
-    if rem["calories"] > 400: suggestions.append("🍝 Balanced: Spicy Tomato Fusilli 250g (395 kcal)")
-    if rem["calories"] < 150: suggestions.append("🍎 Light: Apple + Greek Yogurt (120 kcal)")
-    for s in suggestions:
-        st.markdown(f'<div class="food-card" style="padding:12px;">{s}</div>', unsafe_allow_html=True)
+def page_shopping():
+    render_hero("🛒 Shopping List & Food Compare", "Plan groceries and compare products side by side.")
 
-# =========================================================
-# 🤖 TAB 4 — AI COACH
-# =========================================================
-with tabs[3]:
-    st.subheader("🤖 AI Nutrition Chatbot — Talk to Your Data")
-    st.caption("Router intents: daily_summary, remaining_macros, portion_calculation, recommendation, food_comparison, food_history...")
+    c1, c2 = st.columns(2)
 
-    st.markdown("#### 🎤 Voice Interaction")
-    audio = st.audio_input("Ask with your voice")
-    if audio:
-        st.audio(audio)
-        try:
-            import speech_recognition as sr
-            r = sr.Recognizer()
-            with sr.AudioFile(audio) as src:
-                aud = r.record(src)
-                text = r.recognize_google(aud)
-                st.success(f"Transcribed: {text}")
-                st.session_state.chat_history.append({"role": "user", "content": text})
-                ans = generate_coach_response(text)
-                st.session_state.chat_history.append({"role": "assistant", "content": ans})
-        except Exception as e:
-            st.warning(f"Voice transcription needs SpeechRecognition + internet: {e}. You can type instead.")
+    with c1:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("🛍️ Shopping List")
+        new_item = st.text_input("Add item")
+        if st.button("Add Item") and new_item:
+            st.session_state.shopping_list.append({"item": new_item, "checked": False})
 
-    chat_box = st.container()
-    with chat_box:
-        for msg in st.session_state.chat_history:
-            css_class = "chat-bubble-user" if msg["role"] == "user" else "chat-bubble-bot"
-            st.markdown(f'<div class="{css_class}">{msg["content"]}</div>', unsafe_allow_html=True)
-        st.markdown('<div style="clear:both;"></div>', unsafe_allow_html=True)
+        for i, it in enumerate(st.session_state.shopping_list):
+            checked = st.checkbox(it["item"], value=it["checked"], key=f"shop_{i}")
+            st.session_state.shopping_list[i]["checked"] = checked
 
-    prompt = st.chat_input("e.g., How many calories do I have left? What should I eat for dinner?")
-    if prompt:
-        st.session_state.chat_history.append({"role": "user", "content": prompt})
-        ans = generate_coach_response(prompt)
-        st.session_state.chat_history.append({"role": "assistant", "content": ans})
-        st.rerun()
+        if st.button("🧹 Clear Checked Items"):
+            st.session_state.shopping_list = [i for i in st.session_state.shopping_list if not i["checked"]]
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
 
-# =========================================================
-# 🛒 TAB 5 — SMART SHOPPING
-# =========================================================
-with tabs[4]:
-    st.subheader("🛒 AI Smart Shopping — Compare & Better Alternatives")
-    cA, cB = st.columns(2)
+    with c2:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("⚖️ Compare Two Foods")
+        names = [f["name"] for f in FOOD_DB]
+        food_a = st.selectbox("Food A", names, index=0)
+        food_b = st.selectbox("Food B", names, index=1)
 
-    with cA:
-        st.markdown("**⚖️ Product Comparison**")
-        prod1 = st.selectbox("Product A", list(FOOD_DB.keys()), index=0)
-        prod2 = st.selectbox("Product B", list(FOOD_DB.keys()), index=1)
-        if st.button("Compare", use_container_width=True):
-            a = FOOD_DB[prod1]; b = FOOD_DB[prod2]
-            comp_df = pd.DataFrame([a, b], index=[prod1, prod2])
-            st.dataframe(comp_df, use_container_width=True)
-            score_a = a["protein"] * 2 - a["sugar"] - a["fat"]
-            score_b = b["protein"] * 2 - b["sugar"] - b["fat"]
-            if score_a > score_b:
-                st.success(f"✅ **{prod1}** is healthier (score {score_a:.1f} vs {score_b:.1f})")
-                st.write(f"Swap tip: Choose {prod1} over {prod2} for more protein & less sugar.")
-            else:
-                st.success(f"✅ **{prod2}** is healthier (score {score_b:.1f} vs {score_a:.1f})")
-                st.write(f"Swap tip: Choose {prod2} over {prod1} for more protein & less sugar.")
+        fa = next(f for f in FOOD_DB if f["name"] == food_a)
+        fb = next(f for f in FOOD_DB if f["name"] == food_b)
 
-    with cB:
-        st.markdown("**🧺 Shopping List**")
-        new_item = st.text_input("Add food")
-        if st.button("Add to List", use_container_width=True) and new_item:
-            st.session_state.shopping_list.append(new_item)
-            st.toast(f"Added '{new_item}' to list", icon="🛒")
+        metrics = ["calories", "protein", "carbs", "fat"]
+        fig = go.Figure()
+        fig.add_trace(go.Bar(name=food_a, x=metrics, y=[fa[m] for m in metrics], marker_color="#43a047"))
+        fig.add_trace(go.Bar(name=food_b, x=metrics, y=[fb[m] for m in metrics], marker_color="#ef6c00"))
+        fig.update_layout(barmode="group", height=350, title="Per 100g Comparison")
+        st.plotly_chart(fig, use_container_width=True)
 
-        for i, item in enumerate(st.session_state.shopping_list):
-            colx, coly = st.columns([4, 1])
-            colx.checkbox(item, key=f"shop_{item}_{i}")  # 🔧 fixed stable key
-            if coly.button("❌", key=f"del_{item}_{i}"):
-                st.session_state.shopping_list.pop(i)
-                st.rerun()
+        better_protein = food_a if fa["protein"] > fb["protein"] else food_b
+        better_cal = food_a if fa["calories"] < fb["calories"] else food_b
+        st.info(f"💪 Higher protein: **{better_protein}** | 🔥 Lower calories: **{better_cal}**")
+        st.markdown('</div>', unsafe_allow_html=True)
 
-        st.markdown("**🤖 Better Alternatives AI**")
-        st.markdown("""
-        <div class="food-card" style="padding:14px;">
-        🍰 Cake → Greek Yogurt + Berries <b>(save 200 kcal, +10g protein)</b><br><br>
-        🥤 Soda → Sparkling Water + Lemon<br><br>
-        🍚 White Rice → Quinoa <b>(more fiber & protein)</b>
-        </div>
-        """, unsafe_allow_html=True)
 
-st.divider()
-st.caption("Built with Nutrition5k + Tesseract OCR + Rule-based/LLM Coach | © Live AI Nutrition Assistant")
+def page_chatbot():
+    render_hero("🤖 AI Nutrition Chatbot", "Ask about your meals, macros, or get advice — by text or voice!")
+
+    context = {
+        "targets": st.session_state.targets or calculate_targets(st.session_state.profile),
+        "consumed": consumed_today(),
+        "remaining": remaining_today(),
+        "goal": st.session_state.profile["goal"],
+    }
+
+    if not CFG.HF_TOKEN:
+        st.warning("⚠️ No HF_TOKEN found in secrets — chatbot running in limited offline mode.")
+
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    colA, colB = st.columns([4, 1])
+    with colB:
+        speak_reply = st.checkbox("🔊 Voice reply", value=False)
+        audio = st.audio_input("🎤 Or speak")
+
+    user_msg = st.chat_input("Ask me anything about your nutrition...")
+
+    if audio is not None and CFG.HF_TOKEN:
+        with st.spinner("Transcribing..."):
+            text = transcribe_audio(audio.getvalue())
+        if text:
+            user_msg = text
+            st.info(f"🎙️ You said: {text}")
+
+    if user_msg:
+        st.session_state.chat_history.append({"role": "user", "content": user_msg})
+        with st.chat_message("user"):
+            st.markdown(user_msg)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                reply = chat_with_ai(user_msg, context)
+            st.markdown(reply)
+            if speak_reply:
+                audio_buf = text_to_speech(reply)
+                if audio_buf:
+                    st.audio(audio_buf, format="audio/mp3")
+
+        st.session_state.chat_history.append({"role": "assistant", "content": reply})
+
+
+# =====================================================================================
+# 7. APP ENTRY POINT
+# =====================================================================================
+def main():
+    inject_css()
+    init_state()
+
+    with st.sidebar:
+        st.markdown("## 🥗 Nutrition AI")
+        st.caption("Live camera · OCR · Chatbot · Shopping")
+        st.markdown("---")
+        st.write(f"**Model:** `{CFG.MODEL_REPO_ID}`")
+        st.write(f"**Device:** `{CFG.DEVICE}`")
+        st.write("**HF Token:** " + ("✅ Connected" if CFG.HF_TOKEN else "❌ Missing"))
+        st.markdown("---")
+        st.caption("Built with Streamlit, PyTorch, timm & Hugging Face 🤗")
+
+    pages = {
+        "🏠 Dashboard": page_dashboard,
+        "📸 Live Scanner": page_live_scanner,
+        "🧾 Label Scanner": page_label_scanner,
+        "📒 Meal Log": page_meal_log,
+        "🎯 Goals": page_goals,
+        "💡 Suggestions": page_suggestions,
+        "🛒 Shopping & Compare": page_shopping,
+        "🤖 AI Chatbot": page_chatbot,
+    }
+
+    if HAS_OPTION_MENU:
+        selected = option_menu(
+            None, list(pages.keys()),
+            icons=["house", "camera", "upc-scan", "journal-text",
+                   "bullseye", "lightbulb", "cart", "chat-dots"],
+            orientation="horizontal",
+            styles={
+                "container": {"padding": "6px", "background-color": "#f1f8f2", "border-radius": "16px"},
+                "nav-link-selected": {"background-color": "#2e7d32"},
+            },
+        )
+    else:
+        selected = st.selectbox("Navigate", list(pages.keys()))
+
+    pages[selected]()
+
+
+if __name__ == "__main__":
+    main()
