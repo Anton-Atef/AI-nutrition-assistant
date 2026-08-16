@@ -1,14 +1,20 @@
 # =========================================================
 #  🥗 AI Nutrition & Smart Shopping Assistant — Streamlit
-#  - Nutrition5k RGB-D regression model (weights from HF Hub)
-#  - HF Inference API for:
-#      Chat: Qwen/Qwen2.5-7B-Instruct
-#      OCR_MODEL = "microsoft/trocr-large-printed" 
-#      ASR : openai/whisper-large-v3
+#  Deployable on Streamlit Community Cloud
+#
+#  ✅ Nutrition model (200MB) downloaded at runtime from HF Hub:
+#     Anton-Atef/AI-nutrition-assistant/best_nutrition_rgbd.pt
+#
+#  ✅ Chat (HF Inference API): Qwen/Qwen2.5-7B-Instruct
+#  ✅ OCR (HF Inference API): TrOCR (supported) + Qwen parses OCR text → strict JSON
+#  ✅ Voice ASR (HF Inference API): openai/whisper-large-v3
+#
+#  IMPORTANT:
+#  - Put HF_TOKEN in Streamlit Secrets (do not hardcode).
 # =========================================================
 
-import os, io, re, json, time, base64
-from typing import Optional, Dict, Any, Tuple, List
+import os, io, re, json, time
+from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
 import pandas as pd
@@ -21,8 +27,7 @@ import torch
 import torch.nn as nn
 import timm
 
-from huggingface_hub import hf_hub_download
-from huggingface_hub import InferenceClient
+from huggingface_hub import hf_hub_download, InferenceClient
 
 
 # -----------------------------
@@ -61,7 +66,7 @@ html, body, [class*="css"]  { font-family: 'Poppins', sans-serif; }
     50% {background-position: 100% 50%;}
     100% {background-position: 0% 50%;}
 }
-.main-header h1 { margin: 0; font-size: 2.0rem; font-weight: 700; letter-spacing: 0.2px; }
+.main-header h1 { margin: 0; font-size: 2.0rem; font-weight: 700; }
 .main-header p  { margin: 6px 0 0; opacity: 0.95; }
 
 /* Glass cards */
@@ -174,8 +179,9 @@ class CFG:
     IMG_SIZE = 256
     TARGET_COLS = ["total_mass", "total_calories", "total_fat", "total_carb", "total_protein"]
 
+    # HF Inference API models
     CHAT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
-    OCR_MODEL = "microsoft/trocr-large-printed" 
+    OCR_VISION_MODEL = "microsoft/trocr-large-printed"  # supported serverless OCR
     ASR_MODEL = "openai/whisper-large-v3"
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -184,7 +190,6 @@ class CFG:
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-# Mild speed tuning on CPU
 try:
     torch.set_num_threads(max(1, min(4, os.cpu_count() or 2)))
 except Exception:
@@ -192,7 +197,6 @@ except Exception:
 
 
 def get_hf_token() -> Optional[str]:
-    """Read token from Streamlit secrets first, then environment."""
     token = None
     try:
         token = st.secrets.get("HF_TOKEN", None)
@@ -202,7 +206,7 @@ def get_hf_token() -> Optional[str]:
 
 
 # -----------------------------
-# 🧠 MODEL DEFINITION
+# 🧠 NUTRITION MODEL
 # -----------------------------
 class NutritionNet(nn.Module):
     def __init__(self, backbone_name: str, in_chans: int = 4, out_dim: int = 5):
@@ -233,9 +237,8 @@ def load_model():
     ckpt_path = hf_hub_download(
         repo_id=CFG.MODEL_REPO_ID,
         filename=CFG.MODEL_FILENAME,
-        token=token,  # works for private repos too
+        token=token,
     )
-
     ckpt = torch.load(ckpt_path, map_location=CFG.DEVICE)
 
     backbone = ckpt.get("backbone", CFG.BACKBONE)
@@ -248,13 +251,9 @@ def load_model():
 
     y_mean = np.array(ckpt["y_mean"], dtype=np.float32)
     y_std = np.array(ckpt["y_std"], dtype=np.float32)
-
     return model, y_mean, y_std, target_cols
 
 
-# -----------------------------
-# 🖼️ PREPROCESS + PREDICT
-# -----------------------------
 def preprocess_image(pil_img: Image.Image, img_size: int = CFG.IMG_SIZE) -> torch.Tensor:
     rgb = np.array(pil_img.convert("RGB"))
     h, w = rgb.shape[:2]
@@ -270,30 +269,27 @@ def preprocess_image(pil_img: Image.Image, img_size: int = CFG.IMG_SIZE) -> torc
     rgb_norm = canvas.astype(np.float32) / 255.0
     rgb_norm = (rgb_norm - IMAGENET_MEAN) / IMAGENET_STD
 
-    # No real depth sensor in typical webcam/phone.
-    # Use neutral pseudo-depth centered at 0 after normalization.
+    # neutral pseudo-depth (no depth sensor)
     depth = np.full((img_size, img_size, 1), 0.5, dtype=np.float32)
     depth = (depth - 0.5) / 0.25
 
     img4 = np.concatenate([rgb_norm, depth], axis=2).astype(np.float32)
-    x = torch.from_numpy(img4).permute(2, 0, 1).unsqueeze(0)  # (1,4,H,W)
+    x = torch.from_numpy(img4).permute(2, 0, 1).unsqueeze(0)
     return x
 
 
 def predict_nutrition(pil_img: Image.Image) -> Dict[str, float]:
     model, y_mean, y_std, target_cols = load_model()
     x = preprocess_image(pil_img).to(CFG.DEVICE)
-
     with torch.no_grad():
         pred = model(x).cpu().numpy()[0]
-
     pred = pred * y_std + y_mean
     pred = np.clip(pred, 0, None)
     return {k: float(v) for k, v in zip(target_cols, pred.tolist())}
 
 
 # -----------------------------
-# 🤖 HF INFERENCE CLIENTS (cached)
+# 🤖 HF INFERENCE CLIENTS
 # -----------------------------
 @st.cache_resource
 def hf_client_text():
@@ -302,9 +298,9 @@ def hf_client_text():
 
 
 @st.cache_resource
-def hf_client_ocr():
+def hf_client_ocr_vision():
     token = get_hf_token()
-    return InferenceClient(model=CFG.OCR_MODEL, token=token) if token else None
+    return InferenceClient(model=CFG.OCR_VISION_MODEL, token=token) if token else None
 
 
 @st.cache_resource
@@ -314,10 +310,27 @@ def hf_client_asr():
 
 
 # -----------------------------
-# 🧾 OCR via Qwen2-VL (Vision)
+# 🧾 OCR (TrOCR) → JSON (Qwen parsing)
 # -----------------------------
-OCR_JSON_PROMPT = """
-Carefully read the provided Nutrition Facts label and extract the nutritional information into a strict JSON object.
+EXPECTED_KEYS = [
+    "product_name",
+    "serving_size",
+    "servings_per_container",
+    "calories",
+    "total_fat_g",
+    "saturated_fat_g",
+    "trans_fat_g",
+    "cholesterol_mg",
+    "sodium_mg",
+    "total_carbohydrates_g",
+    "dietary_fiber_g",
+    "total_sugars_g",
+    "added_sugars_g",
+    "protein_g",
+]
+
+OCR_TO_JSON_PROMPT = """
+Convert the OCR text of a Nutrition Facts label into a strict JSON object.
 
 Use EXACTLY these keys:
 - "product_name" (string or null)
@@ -336,159 +349,118 @@ Use EXACTLY these keys:
 - "protein_g" (number only or null)
 
 Rules:
-1) Extract ONLY numeric values for nutrients (exclude units like g/mg).
-2) Do NOT confuse % Daily Value with grams/mg.
-3) If not visible or not reliable, set it to null. NEVER guess.
-4) Return ONLY valid JSON (no markdown, no commentary).
+1) Do NOT use % Daily Value numbers.
+2) If a value is not visible/reliable, set it to null. Never guess.
+3) Return ONLY valid JSON (no markdown, no explanations).
 """.strip()
 
 
-def _data_url_from_pil(pil_img: Image.Image) -> str:
-    buf = io.BytesIO()
-    pil_img.save(buf, format="PNG")
-    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{b64}"
-
-
 def _extract_json_object(text: str) -> Optional[dict]:
-    # Find first {...} block, best-effort
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
         return None
-    candidate = text[start : end + 1]
     try:
-        return json.loads(candidate)
+        return json.loads(text[start : end + 1])
     except Exception:
         return None
 
 
-def extract_nutrition_ocr_hf(pil_img: Image.Image) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    client = hf_client_ocr()
-    if client is None:
-        return None, "HF_TOKEN missing. Add HF_TOKEN in Streamlit Secrets to enable OCR."
+def preprocess_label_for_ocr(pil_img: Image.Image) -> Image.Image:
+    """
+    Light label enhancement to improve OCR:
+    - upscale
+    - increase contrast slightly
+    """
+    img = np.array(pil_img.convert("RGB"))
+    h, w = img.shape[:2]
 
-    try:
-        image_url = _data_url_from_pil(pil_img)
+    # upscale to help OCR (cap size for speed)
+    target_w = 1400
+    if w < target_w:
+        scale = target_w / max(1, w)
+        nh, nw = int(h * scale), int(w * scale)
+        img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_CUBIC)
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                    {"type": "text", "text": OCR_JSON_PROMPT},
-                ],
-            }
-        ]
+    # contrast + sharpness
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l2 = clahe.apply(l)
+    lab2 = cv2.merge([l2, a, b])
+    img2 = cv2.cvtColor(lab2, cv2.COLOR_LAB2RGB)
 
-        resp = client.chat_completion(
-            messages=messages,
-            max_tokens=450,
-            temperature=0.1,
-        )
-        out_text = resp.choices[0].message["content"]
-        parsed = _extract_json_object(out_text)
-        if not isinstance(parsed, dict):
-            return None, "OCR model did not return valid JSON. Try a clearer label photo."
-
-        parsed["raw_model_text"] = out_text
-        return parsed, None
-
-    except Exception as e:
-        return None, f"OCR failed: {e}"
+    return Image.fromarray(img2)
 
 
-
-
-
-
-# --------------------------------------------
-
-
-NUM_PAT = r"([\d]+\.?[\d]*)"
-
-OCR_PATTERNS = {
-    "calories":              rf"calories\D{{0,10}}{NUM_PAT}",
-    "total_fat_g":           rf"total\s*fat\D{{0,10}}{NUM_PAT}\s*g",
-    "saturated_fat_g":       rf"saturated\s*fat\D{{0,10}}{NUM_PAT}\s*g",
-    "trans_fat_g":           rf"trans\s*fat\D{{0,10}}{NUM_PAT}\s*g",
-    "cholesterol_mg":        rf"cholesterol\D{{0,10}}{NUM_PAT}\s*mg",
-    "sodium_mg":             rf"sodium\D{{0,10}}{NUM_PAT}\s*mg",
-    "total_carbohydrates_g": rf"total\s*carb\w*\D{{0,10}}{NUM_PAT}\s*g",
-    "dietary_fiber_g":       rf"(?:dietary\s*)?fiber\D{{0,10}}{NUM_PAT}\s*g",
-    "total_sugars_g":        rf"(?:total\s*)?sugars\D{{0,10}}{NUM_PAT}\s*g",
-    "added_sugars_g":        rf"added\s*sugars\D{{0,10}}{NUM_PAT}\s*g",
-    "protein_g":             rf"protein\D{{0,10}}{NUM_PAT}\s*g",
-}
-
-def _pil_to_png_bytes(pil_img):
+def _pil_to_png_bytes(pil_img: Image.Image) -> bytes:
     buf = io.BytesIO()
-    pil_img.convert("RGB").save(buf, format="PNG")
+    pil_img.save(buf, format="PNG")
     return buf.getvalue()
 
-def _parse_nutrition_from_text(text: str) -> dict:
-    low = text.lower().replace("\n", " ")
-    result = {"product_name": None, "serving_size": None, "servings_per_container": None}
-    for key, pat in OCR_PATTERNS.items():
-        m = re.search(pat, low)
-        result[key] = float(m.group(1)) if m else None
 
-    sm = re.search(r"serving size\D{0,15}([\d\.]+\s*\w+\s*\(?\d*\s*g?\)?)", low)
-    if sm:
-        result["serving_size"] = sm.group(1)
-
-    spc = re.search(r"servings per container\D{0,15}" + NUM_PAT, low)
-    if spc:
-        try:
-            result["servings_per_container"] = float(spc.group(1))
-        except Exception:
-            pass
-
-    result["raw_text"] = text
-    return result
-
-def extract_nutrition_ocr_hf(pil_img: Image.Image):
-    client = hf_client_ocr()
-    if client is None:
+def extract_nutrition_ocr_hf(pil_img: Image.Image) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    token = get_hf_token()
+    if not token:
         return None, "HF_TOKEN missing. Add it in Streamlit Secrets."
 
+    ocr_client = hf_client_ocr_vision()
+    chat_client = hf_client_text()
+    if ocr_client is None or chat_client is None:
+        return None, "HF clients not available. Check HF_TOKEN and requirements."
+
     try:
-        img_bytes = _pil_to_png_bytes(pil_img)
+        # 1) OCR text using TrOCR
+        prep = preprocess_label_for_ocr(pil_img)
+        img_bytes = _pil_to_png_bytes(prep)
 
-        # HF Inference (serverless) OCR
-        out = client.image_to_text(img_bytes)
+        ocr_out = ocr_client.image_to_text(img_bytes)
 
-        # depending on backend, out can be list[dict] or dict
-        if isinstance(out, list) and out:
-            text = out[0].get("generated_text", "")
-        elif isinstance(out, dict):
-            text = out.get("generated_text", "")
+        # normalize return types
+        if isinstance(ocr_out, list) and ocr_out:
+            ocr_text = ocr_out[0].get("generated_text") or ocr_out[0].get("text") or str(ocr_out[0])
+        elif isinstance(ocr_out, dict):
+            ocr_text = ocr_out.get("generated_text") or ocr_out.get("text") or str(ocr_out)
         else:
-            text = str(out)
+            ocr_text = str(ocr_out)
 
-        data = _parse_nutrition_from_text(text)
-        return data, None
+        ocr_text = (ocr_text or "").strip()
+        if len(ocr_text) < 10:
+            return None, "OCR text is empty/too short. Take a closer, clearer label photo."
+
+        # 2) Parse OCR text into strict JSON using Qwen chat
+        messages = [
+            {"role": "system", "content": "You extract Nutrition Facts. Output ONLY JSON."},
+            {"role": "user", "content": OCR_TO_JSON_PROMPT + "\n\nOCR TEXT:\n" + ocr_text},
+        ]
+        resp = chat_client.chat_completion(messages=messages, max_tokens=500, temperature=0.1)
+        llm_text = resp.choices[0].message["content"]
+
+        parsed = _extract_json_object(llm_text)
+        if not isinstance(parsed, dict):
+            return None, "Could not parse JSON from the AI output. Try a clearer close-up label photo."
+
+        clean = {k: parsed.get(k, None) for k in EXPECTED_KEYS}
+        clean["raw_ocr_text"] = ocr_text
+        clean["raw_llm_text"] = llm_text
+        return clean, None
+
     except Exception as e:
         return None, f"OCR failed: {e}"
-
-
-# -----------------------------------------------------------------------------------------------
-
 
 
 # -----------------------------
-# 🎙️ ASR via Whisper-large-v3 (HF)
+# 🎙️ ASR (Whisper via HF)
 # -----------------------------
 def transcribe_audio_hf(audio_bytes: bytes) -> Tuple[Optional[str], Optional[str]]:
     client = hf_client_asr()
     if client is None:
-        return None, "HF_TOKEN missing. Add HF_TOKEN in Streamlit Secrets to enable voice."
+        return None, "HF_TOKEN missing. Add it in Streamlit Secrets to enable voice."
 
     try:
-        # Try common InferenceClient task names across versions
+        # different hub versions expose different method names; try best-effort
         if hasattr(client, "automatic_speech_recognition"):
             res = client.automatic_speech_recognition(audio=audio_bytes)
-            # Can be str or dict-like depending on backend
             if isinstance(res, str):
                 return res, None
             if isinstance(res, dict) and "text" in res:
@@ -507,7 +479,7 @@ def transcribe_audio_hf(audio_bytes: bytes) -> Tuple[Optional[str], Optional[str
 
 
 # -----------------------------
-# 🧭 SIMPLE INTENT ROUTER
+# 🧭 SIMPLE ROUTER
 # -----------------------------
 class Route:
     def __init__(self, intent: str, confidence: float):
@@ -531,22 +503,9 @@ class AIRouter:
                 r"how much.*carb.*(left|remaining)",
                 r"how much.*fat.*(left|remaining)",
             ],
-            "user_targets": [
-                r"my.*target",
-                r"my macros",
-                r"calorie target",
-                r"protein target",
-            ],
-            "recommendation": [
-                r"what should i eat",
-                r"recommend.*meal",
-                r"what.*eat.*(dinner|lunch|breakfast)",
-            ],
-            "comparison": [
-                r"compare",
-                r"which.*better",
-                r"better.*between",
-            ],
+            "user_targets": [r"my.*target", r"my macros", r"calorie target", r"protein target"],
+            "recommendation": [r"what should i eat", r"recommend.*meal", r"what.*eat.*(dinner|lunch|breakfast)"],
+            "comparison": [r"compare", r"which.*better", r"better.*between"],
         }
 
     def route(self, message: str) -> Route:
@@ -562,7 +521,7 @@ ROUTER = AIRouter()
 
 SYSTEM_PROMPT = (
     "You are an AI Nutrition Coach inside a nutrition tracking app.\n"
-    "Use ONLY the trusted user/app data provided to you in the context.\n"
+    "Use ONLY the trusted user/app data provided in the context.\n"
     "Never invent calories/macros.\n"
     "Be concise, supportive, and never shame the user.\n"
     "Do not claim to be a doctor; for medical questions advise consulting a professional.\n"
@@ -742,7 +701,7 @@ with tab_scan:
 
 
 # =========================================================
-# 🧾 TAB 2 — NUTRITION LABEL OCR (Qwen2-VL)
+# 🧾 TAB 2 — LABEL OCR (TrOCR + Qwen JSON)
 # =========================================================
 with tab_ocr:
     st.markdown("Upload or capture a packaged product label (**Nutrition Facts**).")
@@ -764,7 +723,7 @@ with tab_ocr:
             st.image(label_img, caption="Label image", use_container_width=True)
 
             if st.button("📖 Extract Nutrition (AI OCR)", type="primary", use_container_width=True):
-                with st.spinner("Reading label with AI OCR…"):
+                with st.spinner("Reading label with OCR + AI parsing…"):
                     data, err = extract_nutrition_ocr_hf(label_img)
 
                 if err:
@@ -775,7 +734,8 @@ with tab_ocr:
 
     if "last_ocr" in st.session_state:
         data = st.session_state["last_ocr"].copy()
-        raw_model_text = data.pop("raw_model_text", None)
+        raw_ocr = data.pop("raw_ocr_text", "")
+        raw_llm = data.pop("raw_llm_text", "")
 
         st.markdown("### ✅ Extracted Nutrition JSON")
         st.code(json.dumps(data, indent=2), language="json")
@@ -788,8 +748,10 @@ with tab_ocr:
             add_to_log(prod_name, data)
             st.success("Added to meal log ✅")
 
-        with st.expander("Debug: raw model output"):
-            st.write(raw_model_text or "")
+        with st.expander("Debug: raw OCR text"):
+            st.write(raw_ocr)
+        with st.expander("Debug: raw parser (LLM) output"):
+            st.write(raw_llm)
 
 
 # =========================================================
@@ -826,21 +788,21 @@ with tab_dash:
     st.markdown("### 🍽️ Meal Log")
     if st.session_state.meal_log:
         st.dataframe(pd.DataFrame(st.session_state.meal_log), use_container_width=True)
+
         cc1, cc2 = st.columns([1, 1])
         with cc1:
             if st.button("🗑️ Clear Meal Log", use_container_width=True):
                 st.session_state.meal_log = []
                 st.rerun()
         with cc2:
-            if st.button("⬇️ Download CSV", use_container_width=True):
-                df = pd.DataFrame(st.session_state.meal_log)
-                st.download_button(
-                    "Download",
-                    data=df.to_csv(index=False).encode("utf-8"),
-                    file_name="meal_log.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
+            df = pd.DataFrame(st.session_state.meal_log)
+            st.download_button(
+                "⬇️ Download CSV",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name="meal_log.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
     else:
         st.info("No meals logged yet — scan a meal or OCR a label to start.")
 
@@ -924,7 +886,6 @@ with tab_shop:
         comp = pd.DataFrame([A, B]).set_index("name")
         st.dataframe(comp, use_container_width=True)
 
-        # Simple heuristic: lower calories & sugar wins (can be expanded)
         a_key = (A["calories"], A["sugar"])
         b_key = (B["calories"], B["sugar"])
         winner = A["name"] if a_key <= b_key else B["name"]
@@ -948,7 +909,7 @@ with tab_chat:
             "meal_log": st.session_state.meal_log,
         }
 
-    def rule_reply(message: str, intent: str, ctx: Dict[str, Any]) -> str:
+    def rule_reply(intent: str, ctx: Dict[str, Any]) -> str:
         r = ctx["remaining"]
         if intent == "daily_summary":
             c = ctx["consumed_today"]
@@ -968,7 +929,7 @@ with tab_chat:
         if intent == "recommendation":
             return (
                 f"You have about **{r['calories']:.0f} kcal** left. "
-                f"To improve protein, aim for a lean protein + veggies + a carb portion that fits."
+                f"To increase protein, choose lean protein + veggies + a carb portion that fits."
             )
         return "Ask me about remaining calories/macros, meal suggestions, or comparing foods."
 
@@ -1017,7 +978,7 @@ with tab_chat:
         with st.spinner("Thinking…"):
             reply = llm_reply(user_msg, ctx)
             if not reply:
-                reply = rule_reply(user_msg, route.intent, ctx)
+                reply = rule_reply(route.intent, ctx)
 
         st.session_state.chat_history.append({"role": "assistant", "content": reply})
         st.rerun()
