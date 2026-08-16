@@ -7,9 +7,10 @@
 #
 #  ✅ Chat (HF Inference API): Qwen/Qwen2.5-7B-Instruct
 #
-#  ✅ OCR (HF Inference API) — NO local heavy model loading (fixes healthz EOF):
-#     - Uses zai-org/GLM-OCR remotely (tries multimodal chat if supported, else image_to_text)
-#     - Then parses to strict JSON using Qwen
+#  ✅ OCR (HF Inference API):
+#     - Default OCR_MODEL = microsoft/trocr-large-printed (image-to-text supported)
+#     - If OCR_MODEL == zai-org/GLM-OCR => uses chat (conversational) ONLY (no image_to_text)
+#     - Qwen parses OCR text into strict JSON
 #     - Fallback: your regex parser parse_nutrition_label_text()
 #
 #  ✅ Voice ASR (HF Inference API): openai/whisper-large-v3
@@ -171,6 +172,21 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
+# -----------------------------
+# Helpers: secrets
+# -----------------------------
+def _secret(key: str, default=None):
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return os.environ.get(key, default)
+
+
+def get_hf_token() -> Optional[str]:
+    return _secret("HF_TOKEN", None)
+
+
 # -----------------------------
 # ⚙️ CONFIG
 # -----------------------------
@@ -183,32 +199,24 @@ class CFG:
     IMG_SIZE = 256
     TARGET_COLS = ["total_mass", "total_calories", "total_fat", "total_carb", "total_protein"]
 
-    # HF Inference API models
     CHAT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
     ASR_MODEL = "openai/whisper-large-v3"
 
-    # ✅ OCR model (remote)
-    OCR_MODEL = "zai-org/GLM-OCR"
+    # ✅ Default OCR model that WORKS on serverless
+    OCR_MODEL = "microsoft/trocr-large-printed"
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+# Apply optional overrides from Secrets
+CFG.MODEL_REPO_ID = _secret("MODEL_REPO_ID", CFG.MODEL_REPO_ID)
+CFG.MODEL_FILENAME = _secret("MODEL_FILENAME", CFG.MODEL_FILENAME)
+CFG.CHAT_MODEL = _secret("CHAT_MODEL", CFG.CHAT_MODEL)
+CFG.ASR_MODEL = _secret("ASR_MODEL", CFG.ASR_MODEL)
+CFG.OCR_MODEL = _secret("OCR_MODEL", CFG.OCR_MODEL)
+
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-
-try:
-    torch.set_num_threads(max(1, min(4, os.cpu_count() or 2)))
-except Exception:
-    pass
-
-
-def get_hf_token() -> Optional[str]:
-    token = None
-    try:
-        token = st.secrets.get("HF_TOKEN", None)
-    except Exception:
-        token = None
-    return token or os.environ.get("HF_TOKEN")
 
 
 # -----------------------------
@@ -275,7 +283,6 @@ def preprocess_image(pil_img: Image.Image, img_size: int = CFG.IMG_SIZE) -> torc
     rgb_norm = canvas.astype(np.float32) / 255.0
     rgb_norm = (rgb_norm - IMAGENET_MEAN) / IMAGENET_STD
 
-    # neutral pseudo-depth (no depth sensor)
     depth = np.full((img_size, img_size, 1), 0.5, dtype=np.float32)
     depth = (depth - 0.5) / 0.25
 
@@ -316,7 +323,7 @@ def hf_client_ocr():
 
 
 # -----------------------------
-# 🧾 OCR PARSING (Your method)
+# 🧾 OCR PARSER (your function) + JSON parsing
 # -----------------------------
 EXPECTED_KEYS = [
     "product_name",
@@ -381,11 +388,6 @@ def _extract_json_object(text: str) -> Optional[dict]:
 
 
 def preprocess_label_for_ocr(pil_img: Image.Image) -> Image.Image:
-    """
-    Light label enhancement to improve OCR:
-    - upscale
-    - increase contrast slightly
-    """
     img = np.array(pil_img.convert("RGB"))
     h, w = img.shape[:2]
 
@@ -416,7 +418,7 @@ def _png_bytes_to_data_uri(png_bytes: bytes) -> str:
     return f"data:image/png;base64,{b64}"
 
 
-# --------- OCR PARSER (exactly your function) ---------
+# --------- OCR PARSER (YOUR PROVIDED ONE) ---------
 def parse_nutrition_label_text(text: str) -> Dict:
     t = text.lower()
 
@@ -449,11 +451,11 @@ def parse_nutrition_label_text(text: str) -> Dict:
 
 def extract_nutrition_ocr_hf(pil_img: Image.Image) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
-    ✅ Streamlit-Cloud-safe OCR:
-    1) Try GLM-OCR remotely with multimodal chat (image + prompt) if supported.
-    2) If not supported, fallback to GLM-OCR image_to_text (OCR text only).
-    3) Parse into strict JSON using Qwen (text model).
-    4) Fallback to your regex parser if JSON parsing fails.
+    OCR workflow:
+    - If OCR_MODEL is GLM-OCR => use chat_completion ONLY (no image_to_text)
+    - Else (default TrOCR) => use image_to_text
+    - Then: Qwen parses OCR text into strict JSON
+    - Fallback: your regex parser
     """
     token = get_hf_token()
     if not token:
@@ -462,34 +464,43 @@ def extract_nutrition_ocr_hf(pil_img: Image.Image) -> Tuple[Optional[Dict[str, A
     ocr_client = hf_client_ocr()
     chat_client = hf_client_text()
     if ocr_client is None:
-        return None, "OCR client not available. Check HF_TOKEN / model access."
+        return None, "OCR client not available. Check HF_TOKEN and model access."
 
     try:
         prep = preprocess_label_for_ocr(pil_img)
         png_bytes = _pil_to_png_bytes(prep)
 
-        raw_output = None
         ocr_text = None
+        raw_llm = None
+        parse_method = None
 
-        # ---- (A) Try multimodal chat_completion (closest to your Colab method) ----
-        try:
-            data_uri = _png_bytes_to_data_uri(png_bytes)
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": data_uri}},
-                        {"type": "text", "text": OCR_TO_JSON_PROMPT},
-                    ],
-                }
-            ]
-            resp = ocr_client.chat_completion(messages=messages, max_tokens=700, temperature=0.1)
-            raw_output = resp.choices[0].message["content"]
-        except Exception:
-            raw_output = None
+        # --- GLM-OCR path (conversational only) ---
+        if "glm-ocr" in CFG.OCR_MODEL.lower():
+            # Provider says: conversational supported, image-to-text NOT supported.
+            # So we only attempt chat with image_url.
+            try:
+                data_uri = _png_bytes_to_data_uri(png_bytes)
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": data_uri}},
+                            {"type": "text", "text": OCR_TO_JSON_PROMPT},
+                        ],
+                    }
+                ]
+                resp = ocr_client.chat_completion(messages=messages, max_tokens=800, temperature=0.1)
+                ocr_text = resp.choices[0].message["content"]
+                parse_method = "glm_chat"
+            except Exception as e:
+                return None, (
+                    "GLM-OCR serverless does not support image OCR in this environment. "
+                    "Set OCR_MODEL to 'microsoft/trocr-large-printed' in Secrets. "
+                    f"Original error: {e}"
+                )
 
-        # ---- (B) Fallback: OCR-only via image_to_text ----
-        if not raw_output:
+        # --- TrOCR path (image-to-text supported) ---
+        else:
             ocr_out = ocr_client.image_to_text(png_bytes)
 
             if isinstance(ocr_out, list) and ocr_out:
@@ -502,33 +513,28 @@ def extract_nutrition_ocr_hf(pil_img: Image.Image) -> Tuple[Optional[Dict[str, A
             ocr_text = (ocr_text or "").strip()
             if len(ocr_text) < 10:
                 return None, "OCR text is empty/too short. Take a closer, clearer label photo."
-        else:
-            # raw_output could already be JSON (best case) or text.
-            ocr_text = raw_output
+            parse_method = "trocr_text"
 
-        # ---- (C) Parse to strict JSON using Qwen ----
-        parsed = None
-        llm_text = None
-        parse_method = "qwen_json"
-
-        # If GLM returned JSON directly, parse it first
+        # Try direct JSON parse first (if model returned JSON)
         parsed = _extract_json_object(ocr_text)
 
+        # If not JSON, ask Qwen to convert OCR text -> strict JSON
         if not isinstance(parsed, dict) and chat_client is not None:
             try:
                 messages2 = [
                     {"role": "system", "content": "You extract Nutrition Facts. Output ONLY JSON."},
-                    {"role": "user", "content": OCR_TO_JSON_PROMPT + "\n\nTEXT:\n" + ocr_text},
+                    {"role": "user", "content": OCR_TO_JSON_PROMPT + "\n\nOCR TEXT:\n" + ocr_text},
                 ]
-                resp2 = chat_client.chat_completion(messages=messages2, max_tokens=500, temperature=0.1)
-                llm_text = resp2.choices[0].message["content"]
-                parsed = _extract_json_object(llm_text)
+                resp2 = chat_client.chat_completion(messages=messages2, max_tokens=600, temperature=0.1)
+                raw_llm = resp2.choices[0].message["content"]
+                parsed = _extract_json_object(raw_llm)
+                if isinstance(parsed, dict):
+                    parse_method = parse_method + "+qwen_json"
             except Exception:
                 parsed = None
 
-        # ---- (D) Regex fallback using your function ----
+        # Regex fallback
         if not isinstance(parsed, dict):
-            parse_method = "regex"
             rx = parse_nutrition_label_text(ocr_text)
             parsed = {
                 "product_name": None,
@@ -546,10 +552,11 @@ def extract_nutrition_ocr_hf(pil_img: Image.Image) -> Tuple[Optional[Dict[str, A
                 "added_sugars_g": rx.get("added_sugars_g"),
                 "protein_g": rx.get("protein_g"),
             }
+            parse_method = "regex_fallback"
 
         clean = {k: parsed.get(k, None) for k in EXPECTED_KEYS}
         clean["raw_ocr_text"] = ocr_text
-        clean["raw_llm_text"] = llm_text
+        clean["raw_llm_text"] = raw_llm
         clean["parse_method"] = parse_method
         return clean, None
 
@@ -706,7 +713,7 @@ with st.sidebar:
             }[x],
         )
 
-        if st.button("⚡ Calculate Targets", width="stretch"):
+        if st.button("⚡ Calculate Targets", use_container_width=True):
             bmr = 10 * weight + 6.25 * height - 5 * age + (5 if sex == "Male" else -161)
             tdee = bmr * activity
             if st.session_state.goal == "Lose Weight":
@@ -766,9 +773,9 @@ with tab_scan:
 
     with c2:
         if image_to_use is not None:
-            st.image(image_to_use, caption="Input image", width="stretch")
+            st.image(image_to_use, caption="Input image", use_container_width=True)
 
-            if st.button("🔍 Analyze Nutrition", type="primary", width="stretch"):
+            if st.button("🔍 Analyze Nutrition", type="primary", use_container_width=True):
                 with st.spinner("Running Nutrition5k model…"):
                     result = predict_nutrition(image_to_use)
                 st.session_state["last_scan"] = result
@@ -798,7 +805,7 @@ with tab_scan:
                 unsafe_allow_html=True,
             )
 
-        if st.button("➕ Add to Meal Log", width="stretch"):
+        if st.button("➕ Add to Meal Log", use_container_width=True):
             add_to_log(st.session_state.get("last_scan_name", "Scanned Food"), r)
             st.success("Added to meal log ✅")
             try:
@@ -808,7 +815,7 @@ with tab_scan:
 
 
 # =========================================================
-# 🧾 TAB 2 — LABEL OCR (GLM-OCR remote + your parser)
+# 🧾 TAB 2 — LABEL OCR
 # =========================================================
 with tab_ocr:
     st.markdown("Upload or capture a packaged product label (**Nutrition Facts**).")
@@ -827,10 +834,10 @@ with tab_ocr:
 
     with b:
         if label_img is not None:
-            st.image(label_img, caption="Label image", width="stretch")
+            st.image(label_img, caption="Label image", use_container_width=True)
 
-            if st.button("📖 Extract Nutrition (AI OCR)", type="primary", width="stretch"):
-                with st.spinner("Reading label with GLM-OCR + parsing…"):
+            if st.button("📖 Extract Nutrition (AI OCR)", type="primary", use_container_width=True):
+                with st.spinner(f"Running OCR model: {CFG.OCR_MODEL} …"):
                     data, err = extract_nutrition_ocr_hf(label_img)
 
                 if err:
@@ -848,10 +855,10 @@ with tab_ocr:
         st.code(json.dumps(data, indent=2), language="json")
 
         df_show = pd.DataFrame(list(data.items()), columns=["Field", "Value"])
-        st.dataframe(df_show, width="stretch")
+        st.dataframe(df_show, use_container_width=True)
 
         prod_name = st.text_input("Product name for log", value=data.get("product_name") or "Packaged Food")
-        if st.button("➕ Add Label Item to Meal Log", width="stretch"):
+        if st.button("➕ Add Label Item to Meal Log", use_container_width=True):
             add_to_log(prod_name, data)
             st.success("Added to meal log ✅")
 
@@ -894,11 +901,11 @@ with tab_dash:
 
     st.markdown("### 🍽️ Meal Log")
     if st.session_state.meal_log:
-        st.dataframe(pd.DataFrame(st.session_state.meal_log), width="stretch")
+        st.dataframe(pd.DataFrame(st.session_state.meal_log), use_container_width=True)
 
         cc1, cc2 = st.columns([1, 1])
         with cc1:
-            if st.button("🗑️ Clear Meal Log", width="stretch"):
+            if st.button("🗑️ Clear Meal Log", use_container_width=True):
                 st.session_state.meal_log = []
                 st.rerun()
         with cc2:
@@ -908,7 +915,7 @@ with tab_dash:
                 data=df.to_csv(index=False).encode("utf-8"),
                 file_name="meal_log.csv",
                 mime="text/csv",
-                width="stretch",
+                use_container_width=True,
             )
     else:
         st.info("No meals logged yet — scan a meal or OCR a label to start.")
@@ -957,14 +964,14 @@ with tab_shop:
     st.markdown("### 🛒 Smart Shopping List")
 
     new_item = st.text_input("Add an item")
-    if st.button("➕ Add Item", width="stretch") and new_item.strip():
+    if st.button("➕ Add Item", use_container_width=True) and new_item.strip():
         st.session_state.shopping_list.append(new_item.strip())
 
     if st.session_state.shopping_list:
         for i, item in enumerate(list(st.session_state.shopping_list)):
             r1, r2 = st.columns([6, 1])
             r1.markdown(f"<div class='glass-card'>• {item}</div>", unsafe_allow_html=True)
-            if r2.button("❌", key=f"del_{i}", width="stretch"):
+            if r2.button("❌", key=f"del_{i}", use_container_width=True):
                 st.session_state.shopping_list.pop(i)
                 st.rerun()
     else:
@@ -989,9 +996,9 @@ with tab_shop:
     with y:
         B = manual_entry("Product B")
 
-    if st.button("⚖️ Compare", type="primary", width="stretch"):
+    if st.button("⚖️ Compare", type="primary", use_container_width=True):
         comp = pd.DataFrame([A, B]).set_index("name")
-        st.dataframe(comp, width="stretch")
+        st.dataframe(comp, use_container_width=True)
 
         a_key = (A["calories"], A["sugar"])
         b_key = (B["calories"], B["sugar"])
@@ -1054,7 +1061,6 @@ with tab_chat:
         except Exception:
             return None
 
-    # Render history
     for m in st.session_state.chat_history:
         cls = "chat-user" if m["role"] == "user" else "chat-bot"
         st.markdown(f"<div class='{cls}'>{m['content']}</div>", unsafe_allow_html=True)
@@ -1065,7 +1071,7 @@ with tab_chat:
     with st.expander("🎙️ Voice input (Whisper via HF)"):
         if hasattr(st, "audio_input"):
             audio = st.audio_input("Record your question")
-            if audio is not None and st.button("Transcribe & Send", width="stretch"):
+            if audio is not None and st.button("Transcribe & Send", use_container_width=True):
                 with st.spinner("Transcribing…"):
                     text, err = transcribe_audio_hf(audio.getvalue())
                 if err:
