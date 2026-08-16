@@ -6,13 +6,17 @@
 #     Anton-Atef/AI-nutrition-assistant/best_nutrition_rgbd.pt
 #
 #  ✅ Chat (HF Inference API): Qwen/Qwen2.5-7B-Instruct
-#  ✅ OCR (LOCAL): EasyOCR + regex parser (your method)
-#     (Removed: OCR_VISION_MODEL = "microsoft/trocr-large-printed")
+#
+#  ✅ OCR (LOCAL, same method as your GLM-OCR notebook):
+#     - transformers AutoProcessor + GlmOcrForConditionalGeneration (zai-org/GLM-OCR)
+#     - prompt forces strict JSON
+#     - robust JSON parsing + fallback regex parser (your parse_nutrition_label_text)
+#
 #  ✅ Voice ASR (HF Inference API): openai/whisper-large-v3
 #
 #  IMPORTANT:
 #  - Put HF_TOKEN in Streamlit Secrets (do not hardcode) for Chat + Voice.
-#  - Add easyocr to requirements.txt for OCR.
+#  - GLM-OCR runs locally and may be heavy on Streamlit Cloud CPU/RAM.
 # =========================================================
 
 import os, io, re, json, time
@@ -185,6 +189,9 @@ class CFG:
     CHAT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
     ASR_MODEL = "openai/whisper-large-v3"
 
+    # Local OCR model (GLM-OCR)
+    GLM_OCR_MODEL_ID = "zai-org/GLM-OCR"
+
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -290,7 +297,7 @@ def predict_nutrition(pil_img: Image.Image) -> Dict[str, float]:
 
 
 # -----------------------------
-# 🤖 HF INFERENCE CLIENTS (Chat + Voice only)
+# 🤖 HF INFERENCE CLIENTS (Chat + Voice)
 # -----------------------------
 @st.cache_resource
 def hf_client_text():
@@ -305,7 +312,7 @@ def hf_client_asr():
 
 
 # -----------------------------
-# 🧾 OCR (EasyOCR) + Your Regex Parser
+# 🧾 OCR (GLM-OCR) + JSON parsing + your regex fallback parser
 # -----------------------------
 EXPECTED_KEYS = [
     "product_name",
@@ -324,44 +331,35 @@ EXPECTED_KEYS = [
     "protein_g",
 ]
 
+GLM_PROMPT_TEXT = """
+Carefully read the provided Nutrition Facts label and extract the nutritional information into a strict JSON object.
 
-@st.cache_resource
-def load_ocr_reader():
-    try:
-        import easyocr  # pip install easyocr
-        return easyocr.Reader(["en"], gpu=False)
-    except Exception:
-        return None
+Use EXACTLY these keys:
+- "product_name" (if visible on the label, otherwise null)
+- "serving_size" (e.g., "1 cup (228g)")
+- "servings_per_container" (number only, e.g., 4)
+- "calories" (number only, e.g., 250)
+- "total_fat_g" (number in grams, e.g., 10)
+- "saturated_fat_g" (number in grams, e.g., 3)
+- "trans_fat_g" (number in grams, e.g., 0)
+- "cholesterol_mg" (number in milligrams, e.g., 20)
+- "sodium_mg" (number in milligrams, e.g., 300)
+- "total_carbohydrates_g" (number in grams, e.g., 30)
+- "dietary_fiber_g" (number in grams, e.g., 4)
+- "total_sugars_g" (number in grams, e.g., 8)
+- "added_sugars_g" (number in grams, e.g., 5)
+- "protein_g" (number in grams, e.g., 8)
 
-
-def preprocess_label_for_ocr(pil_img: Image.Image) -> Image.Image:
-    """
-    Light label enhancement to improve OCR:
-    - upscale
-    - increase contrast slightly
-    """
-    img = np.array(pil_img.convert("RGB"))
-    h, w = img.shape[:2]
-
-    # upscale to help OCR (cap size for speed)
-    target_w = 1400
-    if w < target_w:
-        scale = target_w / max(1, w)
-        nh, nw = int(h * scale), int(w * scale)
-        img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_CUBIC)
-
-    # contrast + sharpness
-    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l2 = clahe.apply(l)
-    lab2 = cv2.merge([l2, a, b])
-    img2 = cv2.cvtColor(lab2, cv2.COLOR_LAB2RGB)
-
-    return Image.fromarray(img2)
+Rules:
+1. Extract ONLY the numeric values for the nutrients, excluding the units (g, mg).
+2. Do NOT confuse the Daily Value percentages (%) with the actual weight amounts (g, mg).
+3. Do NOT confuse serving size with total product size.
+4. If a value is not visible or cannot be reliably extracted, set it to null. NEVER invent or guess missing values.
+5. Return ONLY valid JSON. Do not include markdown formatting, introductory text, or explanations.
+""".strip()
 
 
-# --------- OCR PARSER (YOUR FUNCTION) ---------
+# --------- OCR PARSER (YOUR REGEX PARSER) ---------
 def parse_nutrition_label_text(text: str) -> Dict:
     t = text.lower()
 
@@ -392,53 +390,192 @@ def parse_nutrition_label_text(text: str) -> Dict:
     return out
 
 
-def extract_nutrition_ocr(pil_img: Image.Image) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def preprocess_label_for_ocr(pil_img: Image.Image) -> Image.Image:
     """
-    OCR with EasyOCR -> parse with regex parser.
-    Returns dict containing EXPECTED_KEYS + debug fields.
+    Light label enhancement to improve OCR:
+    - upscale
+    - increase contrast slightly
     """
-    reader = load_ocr_reader()
-    if reader is None:
-        return None, "EasyOCR is not installed. Add `easyocr` to requirements.txt and redeploy."
+    img = np.array(pil_img.convert("RGB"))
+    h, w = img.shape[:2]
+
+    # upscale to help OCR (cap size for speed)
+    target_w = 1400
+    if w < target_w:
+        scale = target_w / max(1, w)
+        nh, nw = int(h * scale), int(w * scale)
+        img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_CUBIC)
+
+    # contrast + sharpness
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l2 = clahe.apply(l)
+    lab2 = cv2.merge([l2, a, b])
+    img2 = cv2.cvtColor(lab2, cv2.COLOR_LAB2RGB)
+
+    return Image.fromarray(img2)
+
+
+def parse_json_from_output(text: str) -> Optional[dict]:
+    match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+    if match:
+        json_str = match.group(1)
+    else:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            json_str = text[start : end + 1]
+        else:
+            return None
+    try:
+        return json.loads(json_str)
+    except Exception:
+        return None
+
+
+def validate_nutrition_data(parsed_dict: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(parsed_dict, dict):
+        return None
+    validated = {"source": "nutrition_label"}
+    for key in EXPECTED_KEYS:
+        validated[key] = parsed_dict.get(key, None)
+    return validated
+
+
+@st.cache_resource(show_spinner="🔽 Loading GLM-OCR (first run only)...")
+def load_glm_ocr():
+    """
+    Loads GLM-OCR locally (same method as your notebook).
+    """
+    try:
+        from transformers import AutoProcessor, GlmOcrForConditionalGeneration
+    except Exception as e:
+        return None, None, f"transformers/GLM-OCR import failed: {e}"
+
+    token = get_hf_token()
 
     try:
-        prep = preprocess_label_for_ocr(pil_img)
-        arr = np.array(prep)
+        processor = AutoProcessor.from_pretrained(
+            CFG.GLM_OCR_MODEL_ID,
+            trust_remote_code=True,
+            token=token,
+        )
 
-        texts = reader.readtext(arr, detail=0)
-        ocr_text = "\n".join([t for t in texts if isinstance(t, str)]).strip()
+        # Prefer device_map on CUDA; otherwise load on CPU.
+        if torch.cuda.is_available():
+            try:
+                model = GlmOcrForConditionalGeneration.from_pretrained(
+                    CFG.GLM_OCR_MODEL_ID,
+                    torch_dtype=torch.float16,
+                    device_map="auto",
+                    trust_remote_code=True,
+                    token=token,
+                )
+            except Exception:
+                model = GlmOcrForConditionalGeneration.from_pretrained(
+                    CFG.GLM_OCR_MODEL_ID,
+                    torch_dtype=torch.float16,
+                    trust_remote_code=True,
+                    token=token,
+                ).to("cuda")
+        else:
+            model = GlmOcrForConditionalGeneration.from_pretrained(
+                CFG.GLM_OCR_MODEL_ID,
+                torch_dtype=torch.float32,
+                trust_remote_code=True,
+                token=token,
+            ).to("cpu")
 
-        if len(ocr_text) < 10:
-            return None, "OCR text is empty/too short. Take a closer, clearer label photo."
+        model.eval()
+        return processor, model, None
+    except Exception as e:
+        return None, None, f"Failed to load GLM-OCR: {e}"
 
-        parsed = parse_nutrition_label_text(ocr_text)
 
-        # Map into your app's expected schema
-        clean = {k: None for k in EXPECTED_KEYS}
-        clean["product_name"] = None
-        clean["servings_per_container"] = None
-        clean["serving_size"] = parsed.get("serving_size", None)
+def extract_nutrition_glm_ocr(pil_img: Image.Image) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Same method:
+    - processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, ...)
+    - model.generate(...)
+    - decode generated part
+    - parse JSON
+    - validate keys
+    - fallback to regex parser if JSON fails
+    """
+    processor, model, err = load_glm_ocr()
+    if err:
+        return None, err
+    if processor is None or model is None:
+        return None, "GLM-OCR is not available."
 
-        for k in [
-            "calories",
-            "total_fat_g",
-            "saturated_fat_g",
-            "trans_fat_g",
-            "cholesterol_mg",
-            "sodium_mg",
-            "total_carbohydrates_g",
-            "dietary_fiber_g",
-            "total_sugars_g",
-            "added_sugars_g",
-            "protein_g",
-        ]:
-            clean[k] = parsed.get(k, None)
+    try:
+        img = preprocess_label_for_ocr(pil_img)
 
-        clean["raw_ocr_text"] = ocr_text
-        clean["raw_llm_text"] = ""  # kept for UI compatibility
-        clean["parse_method"] = "regex"
-        clean["raw_text"] = parsed.get("raw_text", "")
-        return clean, None
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": img},
+                    {"type": "text", "text": GLM_PROMPT_TEXT},
+                ],
+            }
+        ]
+
+        inputs = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(model.device)
+
+        with torch.inference_mode():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=512,
+                temperature=0.1,
+                do_sample=False,
+            )
+
+        input_len = inputs["input_ids"].shape[-1]
+        generated_ids = output_ids[0][input_len:]
+        raw_output = processor.decode(generated_ids, skip_special_tokens=True).strip()
+
+        parsed = parse_json_from_output(raw_output)
+        validated = validate_nutrition_data(parsed)
+
+        # Fallback: your regex parser on the raw output text
+        if validated is None:
+            fallback = parse_nutrition_label_text(raw_output)
+            validated = {"source": "nutrition_label"}
+            # map into expected keys (best-effort)
+            validated["product_name"] = None
+            validated["serving_size"] = fallback.get("serving_size", None)
+            validated["servings_per_container"] = None
+            for k in [
+                "calories",
+                "total_fat_g",
+                "saturated_fat_g",
+                "trans_fat_g",
+                "cholesterol_mg",
+                "sodium_mg",
+                "total_carbohydrates_g",
+                "dietary_fiber_g",
+                "total_sugars_g",
+                "added_sugars_g",
+                "protein_g",
+            ]:
+                validated[k] = fallback.get(k, None)
+            parse_method = "regex_fallback"
+        else:
+            parse_method = "glm_json"
+
+        # debug fields (kept compatible with your UI)
+        validated["raw_ocr_text"] = raw_output
+        validated["raw_llm_text"] = ""
+        validated["parse_method"] = parse_method
+        return validated, None
 
     except Exception as e:
         return None, f"OCR failed: {e}"
@@ -453,7 +590,6 @@ def transcribe_audio_hf(audio_bytes: bytes) -> Tuple[Optional[str], Optional[str
         return None, "HF_TOKEN missing. Add it in Streamlit Secrets to enable voice."
 
     try:
-        # different hub versions expose different method names; try best-effort
         if hasattr(client, "automatic_speech_recognition"):
             res = client.automatic_speech_recognition(audio=audio_bytes)
             if isinstance(res, str):
@@ -622,7 +758,7 @@ with st.sidebar:
     t["fat"] = st.number_input("Fat target (g)", 10, 300, int(t["fat"]))
 
     st.divider()
-    st.caption("🔐 Add `HF_TOKEN` in Streamlit Secrets to enable Chat + Voice (OCR is local EasyOCR).")
+    st.caption("🔐 Add `HF_TOKEN` in Streamlit Secrets to enable Chat + Voice. OCR uses local GLM-OCR.")
 
 
 # -----------------------------
@@ -696,7 +832,7 @@ with tab_scan:
 
 
 # =========================================================
-# 🧾 TAB 2 — LABEL OCR (EasyOCR + regex parser)
+# 🧾 TAB 2 — LABEL OCR (GLM-OCR method)
 # =========================================================
 with tab_ocr:
     st.markdown("Upload or capture a packaged product label (**Nutrition Facts**).")
@@ -718,8 +854,8 @@ with tab_ocr:
             st.image(label_img, caption="Label image", use_container_width=True)
 
             if st.button("📖 Extract Nutrition (AI OCR)", type="primary", use_container_width=True):
-                with st.spinner("Reading label with OCR + parsing…"):
-                    data, err = extract_nutrition_ocr(label_img)
+                with st.spinner("Running GLM-OCR… (may take some time)"):
+                    data, err = extract_nutrition_glm_ocr(label_img)
 
                 if err:
                     st.error(err)
@@ -743,7 +879,7 @@ with tab_ocr:
             add_to_log(prod_name, data)
             st.success("Added to meal log ✅")
 
-        with st.expander("Debug: raw OCR text"):
+        with st.expander("Debug: raw OCR/model output"):
             st.write(raw_ocr)
         with st.expander("Debug: raw parser (LLM) output"):
             st.write(raw_llm)
@@ -942,7 +1078,6 @@ with tab_chat:
         except Exception:
             return None
 
-    # Render history
     for m in st.session_state.chat_history:
         cls = "chat-user" if m["role"] == "user" else "chat-bot"
         st.markdown(f"<div class='{cls}'>{m['content']}</div>", unsafe_allow_html=True)
