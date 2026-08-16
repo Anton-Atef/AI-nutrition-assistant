@@ -3,7 +3,7 @@
 #  - Nutrition5k RGB-D regression model (weights from HF Hub)
 #  - HF Inference API for:
 #      Chat: Qwen/Qwen2.5-7B-Instruct
-#      OCR : Qwen/Qwen2-VL-7B-Instruct (Vision)
+#      OCR_MODEL = "microsoft/trocr-large-printed" 
 #      ASR : openai/whisper-large-v3
 # =========================================================
 
@@ -175,7 +175,7 @@ class CFG:
     TARGET_COLS = ["total_mass", "total_calories", "total_fat", "total_carb", "total_protein"]
 
     CHAT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
-    OCR_MODEL = "Qwen/Qwen2-VL-7B-Instruct"
+    OCR_MODEL = "microsoft/trocr-large-printed" 
     ASR_MODEL = "openai/whisper-large-v3"
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -396,6 +396,84 @@ def extract_nutrition_ocr_hf(pil_img: Image.Image) -> Tuple[Optional[Dict[str, A
 
     except Exception as e:
         return None, f"OCR failed: {e}"
+
+
+
+
+
+
+# --------------------------------------------
+
+
+NUM_PAT = r"([\d]+\.?[\d]*)"
+
+OCR_PATTERNS = {
+    "calories":              rf"calories\D{{0,10}}{NUM_PAT}",
+    "total_fat_g":           rf"total\s*fat\D{{0,10}}{NUM_PAT}\s*g",
+    "saturated_fat_g":       rf"saturated\s*fat\D{{0,10}}{NUM_PAT}\s*g",
+    "trans_fat_g":           rf"trans\s*fat\D{{0,10}}{NUM_PAT}\s*g",
+    "cholesterol_mg":        rf"cholesterol\D{{0,10}}{NUM_PAT}\s*mg",
+    "sodium_mg":             rf"sodium\D{{0,10}}{NUM_PAT}\s*mg",
+    "total_carbohydrates_g": rf"total\s*carb\w*\D{{0,10}}{NUM_PAT}\s*g",
+    "dietary_fiber_g":       rf"(?:dietary\s*)?fiber\D{{0,10}}{NUM_PAT}\s*g",
+    "total_sugars_g":        rf"(?:total\s*)?sugars\D{{0,10}}{NUM_PAT}\s*g",
+    "added_sugars_g":        rf"added\s*sugars\D{{0,10}}{NUM_PAT}\s*g",
+    "protein_g":             rf"protein\D{{0,10}}{NUM_PAT}\s*g",
+}
+
+def _pil_to_png_bytes(pil_img):
+    buf = io.BytesIO()
+    pil_img.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+def _parse_nutrition_from_text(text: str) -> dict:
+    low = text.lower().replace("\n", " ")
+    result = {"product_name": None, "serving_size": None, "servings_per_container": None}
+    for key, pat in OCR_PATTERNS.items():
+        m = re.search(pat, low)
+        result[key] = float(m.group(1)) if m else None
+
+    sm = re.search(r"serving size\D{0,15}([\d\.]+\s*\w+\s*\(?\d*\s*g?\)?)", low)
+    if sm:
+        result["serving_size"] = sm.group(1)
+
+    spc = re.search(r"servings per container\D{0,15}" + NUM_PAT, low)
+    if spc:
+        try:
+            result["servings_per_container"] = float(spc.group(1))
+        except Exception:
+            pass
+
+    result["raw_text"] = text
+    return result
+
+def extract_nutrition_ocr_hf(pil_img: Image.Image):
+    client = hf_client_ocr()
+    if client is None:
+        return None, "HF_TOKEN missing. Add it in Streamlit Secrets."
+
+    try:
+        img_bytes = _pil_to_png_bytes(pil_img)
+
+        # HF Inference (serverless) OCR
+        out = client.image_to_text(img_bytes)
+
+        # depending on backend, out can be list[dict] or dict
+        if isinstance(out, list) and out:
+            text = out[0].get("generated_text", "")
+        elif isinstance(out, dict):
+            text = out.get("generated_text", "")
+        else:
+            text = str(out)
+
+        data = _parse_nutrition_from_text(text)
+        return data, None
+    except Exception as e:
+        return None, f"OCR failed: {e}"
+
+
+# -----------------------------------------------------------------------------------------------
+
 
 
 # -----------------------------
