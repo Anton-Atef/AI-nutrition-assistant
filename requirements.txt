@@ -7,3 +7,9 @@ pillow
 numpy
 pandas
 huggingface_hub>=0.26
+easyocr>=1.7.1
+scipy
+pyyaml
+python-bidi
+Shapely
+pyclipper
