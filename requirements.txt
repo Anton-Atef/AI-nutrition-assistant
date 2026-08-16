@@ -5,4 +5,4 @@ opencv-python-headless
 pillow
 numpy
 pandas
-huggingface_hub>=0.24
+huggingface_hub>=0.26
