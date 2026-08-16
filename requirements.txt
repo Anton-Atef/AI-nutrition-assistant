@@ -1,11 +1,8 @@
-streamlit>=1.32
+streamlit>=1.36
 torch>=2.1
 timm>=0.9
-huggingface_hub>=0.23
 opencv-python-headless
 pillow
 numpy
 pandas
-pytesseract
-gTTS
-SpeechRecognition
+huggingface_hub>=0.24
