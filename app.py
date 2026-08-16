@@ -7,6 +7,7 @@
 #
 #  ✅ Chat (HF Inference API): Qwen/Qwen2.5-7B-Instruct
 #  ✅ OCR (HF Inference API): TrOCR (supported) + Qwen parses OCR text → strict JSON
+#     + Regex fallback parser (added) if Qwen JSON parsing fails/unavailable
 #  ✅ Voice ASR (HF Inference API): openai/whisper-large-v3
 #
 #  IMPORTANT:
@@ -310,7 +311,7 @@ def hf_client_asr():
 
 
 # -----------------------------
-# 🧾 OCR (TrOCR) → JSON (Qwen parsing)
+# 🧾 OCR (TrOCR) → JSON (Qwen parsing) + Regex fallback
 # -----------------------------
 EXPECTED_KEYS = [
     "product_name",
@@ -353,6 +354,57 @@ Rules:
 2) If a value is not visible/reliable, set it to null. Never guess.
 3) Return ONLY valid JSON (no markdown, no explanations).
 """.strip()
+
+
+def parse_nutrition_label_text_regex(text: str) -> Dict[str, Any]:
+    t = (text or "").lower()
+
+    def find_num(pattern: str) -> Optional[float]:
+        m = re.search(pattern, t, re.I)
+        if not m:
+            return None
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+
+    def find_str(pattern: str) -> Optional[str]:
+        m = re.search(pattern, text or "", re.I)
+        return m.group(1).strip() if m else None
+
+    out = {k: None for k in EXPECTED_KEYS}
+
+    # strings
+    out["product_name"] = None  # do not guess
+    out["serving_size"] = find_str(r"serving\s*size\s*[:]*\s*([^\n\r]+)")
+    out["servings_per_container"] = find_num(r"servings?\s*per\s*container\s*[:]*\s*(\d+\.?\d*)")
+
+    # calories
+    out["calories"] = find_num(r"calories?\s*[:]*\s*(\d+\.?\d*)")
+
+    # fats
+    out["total_fat_g"] = find_num(r"total\s*fat[^\d]*(\d+\.?\d*)\s*g")
+    out["saturated_fat_g"] = find_num(r"saturated\s*fat[^\d]*(\d+\.?\d*)\s*g")
+    out["trans_fat_g"] = find_num(r"trans\s*fat[^\d]*(\d+\.?\d*)\s*g")
+
+    # cholesterol/sodium
+    out["cholesterol_mg"] = find_num(r"cholesterol[^\d]*(\d+\.?\d*)\s*mg")
+    out["sodium_mg"] = find_num(r"sodium[^\d]*(\d+\.?\d*)\s*mg")
+
+    # carbs
+    out["total_carbohydrates_g"] = find_num(r"(?:total\s*)?carbohydrate[^\d]*(\d+\.?\d*)\s*g")
+    out["dietary_fiber_g"] = find_num(r"dietary\s*fiber[^\d]*(\d+\.?\d*)\s*g")
+    out["total_sugars_g"] = find_num(r"total\s*sugars?[^\d]*(\d+\.?\d*)\s*g")
+
+    # added sugars formats vary:
+    out["added_sugars_g"] = find_num(r"added\s*sugars?[^\d]*(\d+\.?\d*)\s*g")
+    if out["added_sugars_g"] is None:
+        out["added_sugars_g"] = find_num(r"includes?\s*(\d+\.?\d*)\s*g\s*added\s*sugars?")
+
+    # protein
+    out["protein_g"] = find_num(r"protein[^\d]*(\d+\.?\d*)\s*g")
+
+    return out
 
 
 def _extract_json_object(text: str) -> Optional[dict]:
@@ -405,9 +457,9 @@ def extract_nutrition_ocr_hf(pil_img: Image.Image) -> Tuple[Optional[Dict[str, A
         return None, "HF_TOKEN missing. Add it in Streamlit Secrets."
 
     ocr_client = hf_client_ocr_vision()
-    chat_client = hf_client_text()
-    if ocr_client is None or chat_client is None:
-        return None, "HF clients not available. Check HF_TOKEN and requirements."
+    chat_client = hf_client_text()  # may be None; we fallback to regex
+    if ocr_client is None:
+        return None, "HF OCR client not available. Check HF_TOKEN and requirements."
 
     try:
         # 1) OCR text using TrOCR
@@ -428,21 +480,32 @@ def extract_nutrition_ocr_hf(pil_img: Image.Image) -> Tuple[Optional[Dict[str, A
         if len(ocr_text) < 10:
             return None, "OCR text is empty/too short. Take a closer, clearer label photo."
 
-        # 2) Parse OCR text into strict JSON using Qwen chat
-        messages = [
-            {"role": "system", "content": "You extract Nutrition Facts. Output ONLY JSON."},
-            {"role": "user", "content": OCR_TO_JSON_PROMPT + "\n\nOCR TEXT:\n" + ocr_text},
-        ]
-        resp = chat_client.chat_completion(messages=messages, max_tokens=500, temperature=0.1)
-        llm_text = resp.choices[0].message["content"]
+        # 2) Parse OCR text:
+        #    Prefer Qwen JSON → fallback to regex parser if JSON fails/unavailable
+        parsed = None
+        llm_text = None
+        parse_method = "qwen_json"
 
-        parsed = _extract_json_object(llm_text)
+        if chat_client is not None:
+            try:
+                messages = [
+                    {"role": "system", "content": "You extract Nutrition Facts. Output ONLY JSON."},
+                    {"role": "user", "content": OCR_TO_JSON_PROMPT + "\n\nOCR TEXT:\n" + ocr_text},
+                ]
+                resp = chat_client.chat_completion(messages=messages, max_tokens=500, temperature=0.1)
+                llm_text = resp.choices[0].message["content"]
+                parsed = _extract_json_object(llm_text)
+            except Exception:
+                parsed = None
+
         if not isinstance(parsed, dict):
-            return None, "Could not parse JSON from the AI output. Try a clearer close-up label photo."
+            parse_method = "regex"
+            parsed = parse_nutrition_label_text_regex(ocr_text)
 
         clean = {k: parsed.get(k, None) for k in EXPECTED_KEYS}
         clean["raw_ocr_text"] = ocr_text
         clean["raw_llm_text"] = llm_text
+        clean["parse_method"] = parse_method
         return clean, None
 
     except Exception as e:
@@ -701,7 +764,7 @@ with tab_scan:
 
 
 # =========================================================
-# 🧾 TAB 2 — LABEL OCR (TrOCR + Qwen JSON)
+# 🧾 TAB 2 — LABEL OCR (TrOCR + Qwen JSON + Regex fallback)
 # =========================================================
 with tab_ocr:
     st.markdown("Upload or capture a packaged product label (**Nutrition Facts**).")
