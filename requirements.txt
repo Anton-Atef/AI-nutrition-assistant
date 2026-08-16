@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+pillow
+plotly
+opencv-python-headless
+easyocr
+pytesseract
+torch
+timm
+huggingface_hub
+transformers
