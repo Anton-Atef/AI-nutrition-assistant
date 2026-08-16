@@ -1,16 +1,21 @@
 streamlit>=1.36
+
+# Core ML
 torch>=2.1
 timm>=0.9
+
+# Data / imaging
 opencv-python-headless
 pillow
 numpy
 pandas
-huggingface_hub>=0.26
 
-easyocr>=1.7.1
-torchvision>=0.16
-scipy
-pyyaml
-python-bidi
-Shapely
-pyclipper
+# Hugging Face
+huggingface_hub>=0.26
+transformers>=4.46.0
+accelerate>=0.34.0
+
+# Common transformer runtime deps (prevents many “missing package” errors)
+safetensors
+sentencepiece
+protobuf
