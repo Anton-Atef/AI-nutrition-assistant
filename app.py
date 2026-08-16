@@ -1,20 +1,26 @@
 # =========================================================
 #  🥗 AI Nutrition & Smart Shopping Assistant — Streamlit
-#  Streamlit Community Cloud friendly (no local OCR weights)
+#  Streamlit Community Cloud friendly
 #
-#  ✅ Nutrition model: Anton-Atef/AI-nutrition-assistant/best_nutrition_rgbd.pt
-#  ✅ Chat (HF Inference API): Qwen/Qwen2.5-7B-Instruct
-#  ✅ OCR (HF Inference API): microsoft/trocr-large-printed (image-to-text supported)
-#     - Qwen parses OCR text → strict JSON
+#  ✅ Nutrition model (200MB) downloaded at runtime from HF Hub:
+#     Anton-Atef/AI-nutrition-assistant/best_nutrition_rgbd.pt
+#
+#  ✅ Chat (HF Inference API): Qwen/Qwen2.5-7B-Instruct (if available)
+#
+#  ✅ OCR (HF Serverless Vision/OCR):
+#     - Uses a fallback list of OCR models that support `image-to-text`
+#     - Default: microsoft/trocr-base-printed (more likely serverless-supported)
+#     - Then Qwen parses OCR text into strict JSON
 #     - Fallback: your regex parser parse_nutrition_label_text()
-#  ✅ Voice ASR (HF Inference API): openai/whisper-large-v3
+#
+#  ✅ Voice ASR (HF Inference API): openai/whisper-large-v3 (if available)
 #
 #  IMPORTANT:
 #  - Put HF_TOKEN in Streamlit Secrets (do not hardcode).
 # =========================================================
 
 import os, io, re, json, time
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -193,12 +199,12 @@ class CFG:
     CHAT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
     ASR_MODEL = "openai/whisper-large-v3"
 
-    # ✅ Must be image-to-text supported on serverless:
-    OCR_MODEL = "microsoft/trocr-large-printed"
+    # Default OCR model (serverless-friendly)
+    OCR_MODEL = "microsoft/trocr-base-printed"
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# optional overrides
+# Optional overrides (from Secrets)
 CFG.MODEL_REPO_ID = _secret("MODEL_REPO_ID", CFG.MODEL_REPO_ID)
 CFG.MODEL_FILENAME = _secret("MODEL_FILENAME", CFG.MODEL_FILENAME)
 CFG.CHAT_MODEL = _secret("CHAT_MODEL", CFG.CHAT_MODEL)
@@ -213,6 +219,7 @@ try:
 except Exception:
     pass
 
+
 # -----------------------------
 # 🧠 NUTRITION MODEL
 # -----------------------------
@@ -220,7 +227,11 @@ class NutritionNet(nn.Module):
     def __init__(self, backbone_name: str, in_chans: int = 4, out_dim: int = 5):
         super().__init__()
         self.backbone = timm.create_model(
-            backbone_name, pretrained=False, in_chans=in_chans, num_classes=0, global_pool="avg"
+            backbone_name,
+            pretrained=False,
+            in_chans=in_chans,
+            num_classes=0,
+            global_pool="avg",
         )
         feat_dim = self.backbone.num_features
         self.head = nn.Sequential(
@@ -233,6 +244,7 @@ class NutritionNet(nn.Module):
 
     def forward(self, x):
         return self.head(self.backbone(x))
+
 
 @st.cache_resource(show_spinner="🔽 Downloading Nutrition model from Hugging Face (first run only)...")
 def load_model():
@@ -256,9 +268,11 @@ def load_model():
     y_std = np.array(ckpt["y_std"], dtype=np.float32)
     return model, y_mean, y_std, target_cols
 
+
 def preprocess_image(pil_img: Image.Image, img_size: int = CFG.IMG_SIZE) -> torch.Tensor:
     rgb = np.array(pil_img.convert("RGB"))
     h, w = rgb.shape[:2]
+
     scale = img_size / max(h, w)
     nh, nw = max(1, int(h * scale)), max(1, int(w * scale))
     rgb_r = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
@@ -277,6 +291,7 @@ def preprocess_image(pil_img: Image.Image, img_size: int = CFG.IMG_SIZE) -> torc
     x = torch.from_numpy(img4).permute(2, 0, 1).unsqueeze(0)
     return x
 
+
 def predict_nutrition(pil_img: Image.Image) -> Dict[str, float]:
     model, y_mean, y_std, target_cols = load_model()
     x = preprocess_image(pil_img).to(CFG.DEVICE)
@@ -286,26 +301,18 @@ def predict_nutrition(pil_img: Image.Image) -> Dict[str, float]:
     pred = np.clip(pred, 0, None)
     return {k: float(v) for k, v in zip(target_cols, pred.tolist())}
 
-# -----------------------------
-# 🤖 HF INFERENCE CLIENTS (force provider="hf-inference")
-# -----------------------------
-@st.cache_resource
-def hf_client_text():
-    token = get_hf_token()
-    return InferenceClient(model=CFG.CHAT_MODEL, token=token, provider="hf-inference", timeout=120) if token else None
-
-@st.cache_resource
-def hf_client_asr():
-    token = get_hf_token()
-    return InferenceClient(model=CFG.ASR_MODEL, token=token, provider="hf-inference", timeout=120) if token else None
-
-@st.cache_resource
-def hf_client_ocr():
-    token = get_hf_token()
-    return InferenceClient(model=CFG.OCR_MODEL, token=token, provider="hf-inference", timeout=120) if token else None
 
 # -----------------------------
-# 🧾 OCR: prompt + parsing
+# 🤖 HF Inference Clients
+# -----------------------------
+@st.cache_resource
+def hf_client(model_id: str):
+    token = get_hf_token()
+    return InferenceClient(model=model_id, token=token, timeout=120) if token else None
+
+
+# -----------------------------
+# 🧾 OCR: prompt + parsing (your method)
 # -----------------------------
 EXPECTED_KEYS = [
     "product_name",
@@ -350,6 +357,7 @@ Rules:
 4) Return ONLY valid JSON (no markdown, no explanations).
 """.strip()
 
+
 def _extract_json_object(text: str) -> Optional[dict]:
     if not text:
         return None
@@ -366,6 +374,7 @@ def _extract_json_object(text: str) -> Optional[dict]:
         return json.loads(s)
     except Exception:
         return None
+
 
 def preprocess_label_for_ocr(pil_img: Image.Image) -> Image.Image:
     img = np.array(pil_img.convert("RGB"))
@@ -385,14 +394,17 @@ def preprocess_label_for_ocr(pil_img: Image.Image) -> Image.Image:
     img2 = cv2.cvtColor(lab2, cv2.COLOR_LAB2RGB)
     return Image.fromarray(img2)
 
+
 def _pil_to_png_bytes(pil_img: Image.Image) -> bytes:
     buf = io.BytesIO()
     pil_img.save(buf, format="PNG")
     return buf.getvalue()
 
+
 # --------- OCR PARSER (YOUR PROVIDED ONE) ---------
 def parse_nutrition_label_text(text: str) -> Dict:
     t = text.lower()
+
     def find(pattern):
         m = re.search(pattern, t, re.I)
         if m:
@@ -401,6 +413,7 @@ def parse_nutrition_label_text(text: str) -> Dict:
             except:
                 return None
         return None
+
     out = {
         "calories": find(r"calories?\s*[:]*\s*(\d+\.?\d*)"),
         "total_fat_g": find(r"total fat[^\d]*(\d+\.?\d*)\s*g"),
@@ -418,54 +431,92 @@ def parse_nutrition_label_text(text: str) -> Dict:
     }
     return out
 
+
+def _normalize_ocr_out(ocr_out: Any) -> str:
+    if isinstance(ocr_out, list) and ocr_out:
+        return (ocr_out[0].get("generated_text") or ocr_out[0].get("text") or str(ocr_out[0])).strip()
+    if isinstance(ocr_out, dict):
+        return (ocr_out.get("generated_text") or ocr_out.get("text") or str(ocr_out)).strip()
+    return str(ocr_out).strip()
+
+
+def run_serverless_ocr(png_bytes: bytes) -> Tuple[str, str]:
+    """
+    Tries multiple OCR models until one works on HF Serverless.
+    Returns: (ocr_text, model_used)
+    """
+    token = get_hf_token()
+    if not token:
+        raise RuntimeError("HF_TOKEN missing")
+
+    candidates: List[str] = []
+    if CFG.OCR_MODEL:
+        candidates.append(CFG.OCR_MODEL)
+
+    # Known OCR candidates (image-to-text)
+    candidates += [
+        "microsoft/trocr-base-printed",
+        "microsoft/trocr-small-printed",
+        "microsoft/trocr-base-handwritten",
+        "microsoft/trocr-small-handwritten",
+    ]
+
+    # unique preserving order
+    seen = set()
+    candidates = [m for m in candidates if m and not (m in seen or seen.add(m))]
+
+    last_err = None
+    for model_id in candidates:
+        # Skip GLM-OCR here: it doesn't support image-to-text in serverless
+        if "glm-ocr" in model_id.lower():
+            continue
+
+        try:
+            client = hf_client(model_id)
+            if client is None:
+                continue
+            out = client.image_to_text(png_bytes)
+            text = _normalize_ocr_out(out)
+            if len(text) >= 10:
+                return text, model_id
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(
+        f"OCR failed for all candidates. Last error: {type(last_err).__name__}: {repr(last_err)}"
+    )
+
+
 def extract_nutrition_ocr_hf(pil_img: Image.Image) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     token = get_hf_token()
     if not token:
         return None, "HF_TOKEN missing. Add it in Streamlit Secrets."
 
-    # Hard block GLM-OCR on serverless (it does not support image-to-text)
-    if "glm-ocr" in (CFG.OCR_MODEL or "").lower():
-        return None, (
-            "This OCR model does NOT support 'image-to-text' on HF Serverless. "
-            "Set OCR_MODEL to 'microsoft/trocr-large-printed' in Secrets."
-        )
-
-    ocr_client = hf_client_ocr()
-    chat_client = hf_client_text()
-    if ocr_client is None:
-        return None, "OCR client not available. Check HF_TOKEN and OCR_MODEL."
-
     try:
         prep = preprocess_label_for_ocr(pil_img)
         png_bytes = _pil_to_png_bytes(prep)
 
-        # 1) OCR text (TrOCR)
-        ocr_out = ocr_client.image_to_text(png_bytes)
+        # 1) OCR text
+        ocr_text, used_ocr_model = run_serverless_ocr(png_bytes)
 
-        if isinstance(ocr_out, list) and ocr_out:
-            ocr_text = ocr_out[0].get("generated_text") or ocr_out[0].get("text") or str(ocr_out[0])
-        elif isinstance(ocr_out, dict):
-            ocr_text = ocr_out.get("generated_text") or ocr_out.get("text") or str(ocr_out)
-        else:
-            ocr_text = str(ocr_out)
-
-        ocr_text = (ocr_text or "").strip()
-        if len(ocr_text) < 10:
-            return None, "OCR text is empty/too short. Take a closer, clearer label photo."
-
-        # 2) Parse OCR text -> strict JSON using Qwen
+        # 2) Qwen parse OCR text -> strict JSON
         parsed = None
         llm_text = None
         parse_method = "qwen_json"
 
+        chat_client = hf_client(CFG.CHAT_MODEL)
         if chat_client is not None:
-            messages = [
-                {"role": "system", "content": "You extract Nutrition Facts. Output ONLY JSON."},
-                {"role": "user", "content": OCR_TO_JSON_PROMPT + "\n\nOCR TEXT:\n" + ocr_text},
-            ]
-            resp = chat_client.chat_completion(messages=messages, max_tokens=650, temperature=0.1)
-            llm_text = resp.choices[0].message["content"]
-            parsed = _extract_json_object(llm_text)
+            try:
+                messages = [
+                    {"role": "system", "content": "You extract Nutrition Facts. Output ONLY JSON."},
+                    {"role": "user", "content": OCR_TO_JSON_PROMPT + "\n\nOCR TEXT:\n" + ocr_text},
+                ]
+                resp = chat_client.chat_completion(messages=messages, max_tokens=650, temperature=0.1)
+                llm_text = resp.choices[0].message["content"]
+                parsed = _extract_json_object(llm_text)
+            except Exception:
+                parsed = None
 
         # 3) Fallback: regex
         if not isinstance(parsed, dict):
@@ -492,19 +543,21 @@ def extract_nutrition_ocr_hf(pil_img: Image.Image) -> Tuple[Optional[Dict[str, A
         clean["raw_ocr_text"] = ocr_text
         clean["raw_llm_text"] = llm_text
         clean["parse_method"] = parse_method
+        clean["ocr_model_used"] = used_ocr_model
         return clean, None
 
     except Exception as e:
-        # IMPORTANT: repr(e) so you never get empty "OCR failed:"
+        # repr(e) to avoid empty "OCR failed:"
         return None, f"OCR failed ({type(e).__name__}): {repr(e)}"
+
 
 # -----------------------------
 # 🎙️ ASR (Whisper via HF)
 # -----------------------------
 def transcribe_audio_hf(audio_bytes: bytes) -> Tuple[Optional[str], Optional[str]]:
-    client = hf_client_asr()
+    client = hf_client(CFG.ASR_MODEL)
     if client is None:
-        return None, "HF_TOKEN missing. Add it in Streamlit Secrets to enable voice."
+        return None, "HF_TOKEN missing (or ASR client unavailable). Add it in Streamlit Secrets."
     try:
         if hasattr(client, "automatic_speech_recognition"):
             res = client.automatic_speech_recognition(audio=audio_bytes)
@@ -512,15 +565,18 @@ def transcribe_audio_hf(audio_bytes: bytes) -> Tuple[Optional[str], Optional[str
                 return res, None
             if isinstance(res, dict) and "text" in res:
                 return res["text"], None
+
         if hasattr(client, "audio_to_text"):
             res = client.audio_to_text(audio_bytes)
             if isinstance(res, str):
                 return res, None
             if isinstance(res, dict) and "text" in res:
                 return res["text"], None
+
         return None, "ASR method not available in this huggingface_hub version."
     except Exception as e:
         return None, f"ASR failed ({type(e).__name__}): {repr(e)}"
+
 
 # -----------------------------
 # 🧭 SIMPLE ROUTER
@@ -529,6 +585,7 @@ class Route:
     def __init__(self, intent: str, confidence: float):
         self.intent = intent
         self.confidence = confidence
+
 
 class AIRouter:
     def __init__(self):
@@ -559,6 +616,7 @@ class AIRouter:
             return Route("general", 0.25)
         return Route(best, min(0.95, 0.55 + scores[best] * 0.15))
 
+
 ROUTER = AIRouter()
 
 SYSTEM_PROMPT = (
@@ -568,6 +626,7 @@ SYSTEM_PROMPT = (
     "Be concise, supportive, and never shame the user.\n"
     "Do not claim to be a doctor; for medical questions advise consulting a professional.\n"
 )
+
 
 # -----------------------------
 # 🗂️ SESSION STATE
@@ -583,6 +642,7 @@ for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
+
 def totals_today() -> Dict[str, float]:
     if not st.session_state.meal_log:
         return {"calories": 0.0, "protein": 0.0, "carb": 0.0, "fat": 0.0}
@@ -593,6 +653,7 @@ def totals_today() -> Dict[str, float]:
         "carb": float(df["total_carb"].sum()),
         "fat": float(df["total_fat"].sum()),
     }
+
 
 def add_to_log(name: str, nutrition: Dict[str, Any]):
     st.session_state.meal_log.append(
@@ -606,6 +667,7 @@ def add_to_log(name: str, nutrition: Dict[str, Any]):
             "total_protein": float(nutrition.get("total_protein", nutrition.get("protein_g", 0)) or 0),
         }
     )
+
 
 # -----------------------------
 # 🎯 SIDEBAR
@@ -637,7 +699,7 @@ with st.sidebar:
             }[x],
         )
 
-        if st.button("⚡ Calculate Targets", use_container_width=True):
+        if st.button("⚡ Calculate Targets", width="stretch"):
             bmr = 10 * weight + 6.25 * height - 5 * age + (5 if sex == "Male" else -161)
             tdee = bmr * activity
             if st.session_state.goal == "Lose Weight":
@@ -667,6 +729,7 @@ with st.sidebar:
     st.divider()
     st.caption("🔐 Add `HF_TOKEN` in Streamlit Secrets to enable Chat + OCR + Voice.")
 
+
 # -----------------------------
 # 🧭 TABS
 # -----------------------------
@@ -695,9 +758,9 @@ with tab_scan:
 
     with c2:
         if image_to_use is not None:
-            st.image(image_to_use, caption="Input image", use_container_width=True)
+            st.image(image_to_use, caption="Input image", width="stretch")
 
-            if st.button("🔍 Analyze Nutrition", type="primary", use_container_width=True):
+            if st.button("🔍 Analyze Nutrition", type="primary", width="stretch"):
                 with st.spinner("Running Nutrition5k model…"):
                     result = predict_nutrition(image_to_use)
                 st.session_state["last_scan"] = result
@@ -727,7 +790,7 @@ with tab_scan:
                 unsafe_allow_html=True,
             )
 
-        if st.button("➕ Add to Meal Log", use_container_width=True):
+        if st.button("➕ Add to Meal Log", width="stretch"):
             add_to_log(st.session_state.get("last_scan_name", "Scanned Food"), r)
             st.success("Added to meal log ✅")
             try:
@@ -735,12 +798,13 @@ with tab_scan:
             except Exception:
                 pass
 
+
 # =========================================================
 # 🧾 TAB 2 — LABEL OCR
 # =========================================================
 with tab_ocr:
     st.markdown("Upload or capture a packaged product label (**Nutrition Facts**).")
-    st.caption(f"OCR model in use: {CFG.OCR_MODEL}")
+    st.caption(f"OCR preferred model (from Secrets/default): {CFG.OCR_MODEL}")
 
     a, b = st.columns(2)
 
@@ -756,9 +820,9 @@ with tab_ocr:
 
     with b:
         if label_img is not None:
-            st.image(label_img, caption="Label image", use_container_width=True)
+            st.image(label_img, caption="Label image", width="stretch")
 
-            if st.button("📖 Extract Nutrition (AI OCR)", type="primary", use_container_width=True):
+            if st.button("📖 Extract Nutrition (AI OCR)", type="primary", width="stretch"):
                 with st.spinner("Reading label with OCR + parsing…"):
                     data, err = extract_nutrition_ocr_hf(label_img)
 
@@ -777,10 +841,10 @@ with tab_ocr:
         st.code(json.dumps(data, indent=2), language="json")
 
         df_show = pd.DataFrame(list(data.items()), columns=["Field", "Value"])
-        st.dataframe(df_show, use_container_width=True)
+        st.dataframe(df_show, width="stretch")
 
         prod_name = st.text_input("Product name for log", value=data.get("product_name") or "Packaged Food")
-        if st.button("➕ Add Label Item to Meal Log", use_container_width=True):
+        if st.button("➕ Add Label Item to Meal Log", width="stretch"):
             add_to_log(prod_name, data)
             st.success("Added to meal log ✅")
 
@@ -788,6 +852,7 @@ with tab_ocr:
             st.write(raw_ocr)
         with st.expander("Debug: raw parser (LLM) output"):
             st.write(raw_llm)
+
 
 # =========================================================
 # 📊 TAB 3 — DASHBOARD
@@ -822,11 +887,11 @@ with tab_dash:
 
     st.markdown("### 🍽️ Meal Log")
     if st.session_state.meal_log:
-        st.dataframe(pd.DataFrame(st.session_state.meal_log), use_container_width=True)
+        st.dataframe(pd.DataFrame(st.session_state.meal_log), width="stretch")
 
         cc1, cc2 = st.columns([1, 1])
         with cc1:
-            if st.button("🗑️ Clear Meal Log", use_container_width=True):
+            if st.button("🗑️ Clear Meal Log", width="stretch"):
                 st.session_state.meal_log = []
                 st.rerun()
         with cc2:
@@ -836,7 +901,7 @@ with tab_dash:
                 data=df.to_csv(index=False).encode("utf-8"),
                 file_name="meal_log.csv",
                 mime="text/csv",
-                use_container_width=True,
+                width="stretch",
             )
     else:
         st.info("No meals logged yet — scan a meal or OCR a label to start.")
@@ -877,6 +942,7 @@ with tab_dash:
 
     st.caption(f"Remaining (approx): {remaining_cal:.0f} kcal, {remaining_pro:.0f} g protein")
 
+
 # =========================================================
 # 🛒 TAB 4 — SHOPPING & COMPARE
 # =========================================================
@@ -884,14 +950,14 @@ with tab_shop:
     st.markdown("### 🛒 Smart Shopping List")
 
     new_item = st.text_input("Add an item")
-    if st.button("➕ Add Item", use_container_width=True) and new_item.strip():
+    if st.button("➕ Add Item", width="stretch") and new_item.strip():
         st.session_state.shopping_list.append(new_item.strip())
 
     if st.session_state.shopping_list:
         for i, item in enumerate(list(st.session_state.shopping_list)):
             r1, r2 = st.columns([6, 1])
             r1.markdown(f"<div class='glass-card'>• {item}</div>", unsafe_allow_html=True)
-            if r2.button("❌", key=f"del_{i}", use_container_width=True):
+            if r2.button("❌", key=f"del_{i}", width="stretch"):
                 st.session_state.shopping_list.pop(i)
                 st.rerun()
     else:
@@ -916,14 +982,15 @@ with tab_shop:
     with y:
         B = manual_entry("Product B")
 
-    if st.button("⚖️ Compare", type="primary", use_container_width=True):
+    if st.button("⚖️ Compare", type="primary", width="stretch"):
         comp = pd.DataFrame([A, B]).set_index("name")
-        st.dataframe(comp, use_container_width=True)
+        st.dataframe(comp, width="stretch")
 
         a_key = (A["calories"], A["sugar"])
         b_key = (B["calories"], B["sugar"])
         winner = A["name"] if a_key <= b_key else B["name"]
         st.success(f"✅ Better pick (lower calories/sugar): **{winner}**")
+
 
 # =========================================================
 # 🤖 TAB 5 — AI COACH + VOICE
@@ -967,7 +1034,7 @@ with tab_chat:
         return "Ask me about remaining calories/macros, meal suggestions, or comparing foods."
 
     def llm_reply(message: str, ctx: Dict[str, Any]) -> Optional[str]:
-        client = hf_client_text()
+        client = hf_client(CFG.CHAT_MODEL)
         if client is None:
             return None
         try:
@@ -990,7 +1057,7 @@ with tab_chat:
     with st.expander("🎙️ Voice input (Whisper via HF)"):
         if hasattr(st, "audio_input"):
             audio = st.audio_input("Record your question")
-            if audio is not None and st.button("Transcribe & Send", use_container_width=True):
+            if audio is not None and st.button("Transcribe & Send", width="stretch"):
                 with st.spinner("Transcribing…"):
                     text, err = transcribe_audio_hf(audio.getvalue())
                 if err:
@@ -1014,6 +1081,7 @@ with tab_chat:
 
         st.session_state.chat_history.append({"role": "assistant", "content": reply})
         st.rerun()
+
 
 st.markdown("---")
 st.caption("⚠️ General nutrition guidance only — not medical advice.")
