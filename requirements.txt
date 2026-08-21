@@ -9,8 +9,10 @@ pillow
 numpy
 pandas
 
-huggingface_hub>=0.26
+huggingface_hub>=0.30.0
+requests>=2.31.0
 
+# Local OCR fallback (recommended)
 easyocr>=1.7.1
 scipy
 pyyaml
