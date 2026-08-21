@@ -5,16 +5,16 @@
 #  ✅ Nutrition model (200MB) downloaded at runtime from HF Hub:
 #     Anton-Atef/AI-nutrition-assistant/best_nutrition_rgbd.pt
 #
-#  ✅ Chat (HF Inference API): from Secrets (may or may not be serverless-supported)
+#  ✅ Chat (HF Inference API): from Secrets (may not be supported by hf-inference)
 #  ✅ Voice ASR (HF Inference API): from Secrets
 #
 #  ✅ OCR (Robust):
 #     1) Try HF Serverless OCR models (image-to-text) in a fallback list
 #     2) If HF OCR is not available/not supported -> fallback to LOCAL EasyOCR (optional)
 #     3) Parse extracted OCR text into strict JSON using OCR_PARSER_MODEL (Flan-T5 recommended)
-#        - tries: text2text_generation -> text_generation -> chat_completion
-#        - always stores raw_llm_text (output OR errors)
-#     4) If LLM JSON fails -> fallback to regex parser
+#        - Uses HF Inference REST via client.post() (more reliable than chat_completion)
+#        - Always stores raw_llm_text (output OR errors)
+#     4) If LLM JSON fails -> fallback to improved regex parser
 #
 #  IMPORTANT:
 #  - Put HF_TOKEN in Streamlit Secrets (do not hardcode).
@@ -173,7 +173,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
 # -----------------------------
 # 🔐 Secrets helper
 # -----------------------------
@@ -185,7 +184,6 @@ def _secret(key: str, default=None):
 
 def get_hf_token() -> Optional[str]:
     return _secret("HF_TOKEN", None)
-
 
 # -----------------------------
 # ⚙️ CONFIG
@@ -205,13 +203,13 @@ class CFG:
     # preferred OCR model (serverless support varies)
     OCR_MODEL = "microsoft/trocr-base-printed"
 
-    # ✅ Dedicated parser model for OCR text -> JSON (serverless-friendly)
+    # ✅ parser model used ONLY to convert OCR text -> JSON
     OCR_PARSER_MODEL = "google/flan-t5-base"
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# Optional overrides from Secrets
+# Optional overrides
 CFG.MODEL_REPO_ID = _secret("MODEL_REPO_ID", CFG.MODEL_REPO_ID)
 CFG.MODEL_FILENAME = _secret("MODEL_FILENAME", CFG.MODEL_FILENAME)
 CFG.CHAT_MODEL = _secret("CHAT_MODEL", CFG.CHAT_MODEL)
@@ -410,37 +408,101 @@ def _pil_to_png_bytes(pil_img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
-# --------- YOUR OCR PARSER (kept) ---------
-def parse_nutrition_label_text(text: str) -> Dict:
-    t = (text or "").lower()
+# -----------------------------
+# ✅ Improved Regex Parser (still "your method", but tolerant)
+# -----------------------------
+def _normalize_ocr_text(text: str) -> str:
+    t = (text or "")
+    t = t.replace("\u00a0", " ")
+    t = t.replace("_", " ")
+    t = t.replace(",", ".")
+    t = re.sub(r"([a-zA-Z])(\d)", r"\1 \2", t)
+    t = re.sub(r"(\d)([a-zA-Z])", r"\1 \2", t)
+    t = re.sub(r"\s+", " ", t)
+    return t
 
-    def find(pattern):
-        m = re.search(pattern, t, re.I)
-        if m:
+def parse_nutrition_label_text(text: str) -> Dict[str, Any]:
+    raw = text or ""
+    t = _normalize_ocr_text(raw).lower()
+
+    # fix very common OCR misspellings (like your sample)
+    t = re.sub(r"\bcaloies\b|\bcaloies\b|\bcaloies\b", "calories", t)
+    t = re.sub(r"iolal", "total", t)
+    t = re.sub(r"\bcrdlesterol\b", "cholesterol", t)
+    t = re.sub(r"carbolydra\w+|carbohydra\w+", "carbohydrate", t)
+    t = re.sub(r"saturaled|saturatcd", "saturated", t)
+
+    def find_num_after(keyword_pat: str, unit_pat: Optional[str], window: int = 80) -> Optional[float]:
+        m = re.search(keyword_pat, t, re.I)
+        if not m:
+            return None
+        chunk = t[m.end(): m.end() + window]
+        if unit_pat:
+            m2 = re.search(r"(\d+(?:\.\d+)?)\s*(?:%s)" % unit_pat, chunk, re.I)
+            if m2:
+                try:
+                    return float(m2.group(1))
+                except:
+                    return None
+        m3 = re.search(r"(\d+(?:\.\d+)?)", chunk)
+        if m3:
             try:
-                return float(m.group(1))
+                return float(m3.group(1))
             except:
                 return None
         return None
 
+    # serving size (best-effort string)
+    serving_size = None
+    m_ss = re.search(r"serving\s*size\s*(.+?)(?:servings?\s*per\s*container|$)", raw, re.I)
+    if m_ss:
+        serving_size = m_ss.group(1).strip()
+
+    # servings per container
+    spc = None
+    m_spc = re.search(r"servings?\s*per\s*container\s*(\d+\.?\d*)", t, re.I)
+    if m_spc:
+        try:
+            spc = float(m_spc.group(1))
+        except:
+            spc = None
+
     out = {
-        "calories": find(r"calories?\s*[:]*\s*(\d+\.?\d*)"),
-        "total_fat_g": find(r"total fat[^\d]*(\d+\.?\d*)\s*g"),
-        "saturated_fat_g": find(r"saturated fat[^\d]*(\d+\.?\d*)"),
-        "trans_fat_g": find(r"trans fat[^\d]*(\d+\.?\d*)"),
-        "cholesterol_mg": find(r"cholesterol[^\d]*(\d+\.?\d*)\s*mg"),
-        "sodium_mg": find(r"sodium[^\d]*(\d+\.?\d*)\s*mg"),
-        "total_carbohydrates_g": find(r"(?:total\s*)?carbohydrate[^\d]*(\d+\.?\d*)\s*g"),
-        "dietary_fiber_g": find(r"dietary fiber[^\d]*(\d+\.?\d*)\s*g"),
-        "total_sugars_g": find(r"total sugars?[^\d]*(\d+\.?\d*)\s*g"),
-        "added_sugars_g": find(r"added sugars?[^\d]*(\d+\.?\d*)\s*g"),
-        "protein_g": find(r"protein[^\d]*(\d+\.?\d*)\s*g"),
-        "serving_size": None,
-        "raw_text": (text or "")[:500],
+        "product_name": None,
+        "serving_size": serving_size,
+        "servings_per_container": spc,
+
+        "calories": find_num_after(r"\bcalories?\b", None),
+        "total_fat_g": find_num_after(r"\btotal\s*fat\b", r"g|gm"),
+        "saturated_fat_g": find_num_after(r"\bsaturated\s*fat\b", r"g|gm"),
+        "trans_fat_g": find_num_after(r"\btrans\s*fat\b", r"g|gm"),
+        "cholesterol_mg": find_num_after(r"\bcholesterol\b", r"mg|m\s*g"),
+        "sodium_mg": find_num_after(r"\bsodium\b", r"mg|m\s*g"),
+        "total_carbohydrates_g": find_num_after(r"\btotal\s*carbohydrate[s]?\b", r"g|gm"),
+        "dietary_fiber_g": find_num_after(r"\b(dietary\s*)?fiber\b", r"g|gm"),
+        "total_sugars_g": find_num_after(r"\btotal\s*sugars?\b", r"g|gm"),
+        "added_sugars_g": None,
+        "protein_g": find_num_after(r"\bprotein\b", r"g|gm"),
+
+        "raw_text": raw[:800],
     }
+
+    # added sugars special format: "includes 0 g added sugars"
+    m_inc = re.search(r"includes?\s*(\d+(?:\.\d+)?)\s*g\s*added\s*sugars?", t, re.I)
+    if m_inc:
+        try:
+            out["added_sugars_g"] = float(m_inc.group(1))
+        except:
+            out["added_sugars_g"] = None
+    else:
+        out["added_sugars_g"] = find_num_after(r"\badded\s*sugars?\b", r"g|gm")
+
     return out
 
 
+# -----------------------------
+# OCR extraction (HF attempt + EasyOCR fallback)
+# -----------------------------
 def _normalize_ocr_out(ocr_out: Any) -> str:
     if isinstance(ocr_out, list) and ocr_out:
         return (ocr_out[0].get("generated_text") or ocr_out[0].get("text") or str(ocr_out[0])).strip()
@@ -457,7 +519,6 @@ def _try_hf_ocr(png_bytes: bytes) -> Tuple[Optional[str], Optional[str], List[st
     candidates: List[str] = []
     if CFG.OCR_MODEL:
         candidates.append(CFG.OCR_MODEL)
-
     candidates += [
         "microsoft/trocr-base-printed",
         "microsoft/trocr-small-printed",
@@ -509,66 +570,28 @@ def _try_local_easyocr(pil_img: Image.Image) -> Tuple[Optional[str], Optional[st
         return None, f"Local OCR failed ({type(e).__name__}): {repr(e)}"
 
 
-def _coerce_number(x: Any) -> Optional[float]:
-    if x is None:
-        return None
-    if isinstance(x, (int, float)):
-        return float(x)
-    if isinstance(x, str):
-        s = x.strip()
-        if not s or s.lower() in {"null", "none", "nan"}:
-            return None
-        m = re.search(r"-?\d+(?:\.\d+)?", s)
-        if not m:
-            return None
+# -----------------------------
+# ✅ LLM parsing that works with Flan-T5 via client.post()
+# -----------------------------
+def _decode_post_response(resp: Any) -> Any:
+    # InferenceClient.post may return bytes
+    if isinstance(resp, (bytes, bytearray)):
         try:
-            return float(m.group(0))
+            return json.loads(resp.decode("utf-8"))
         except Exception:
-            return None
-    return None
+            return resp.decode("utf-8", errors="ignore")
+    # may already be dict/list/str
+    return resp
 
 
-def _clean_llm_dict(d: dict) -> dict:
-    out = {k: d.get(k, None) for k in EXPECTED_KEYS}
-
-    for k in [
-        "servings_per_container",
-        "calories",
-        "total_fat_g",
-        "saturated_fat_g",
-        "trans_fat_g",
-        "cholesterol_mg",
-        "sodium_mg",
-        "total_carbohydrates_g",
-        "dietary_fiber_g",
-        "total_sugars_g",
-        "added_sugars_g",
-        "protein_g",
-    ]:
-        out[k] = _coerce_number(out.get(k, None))
-
-    if out.get("product_name") is not None:
-        out["product_name"] = str(out["product_name"]).strip() or None
-    if out.get("serving_size") is not None:
-        out["serving_size"] = str(out["serving_size"]).strip() or None
-
-    return out
-
-
-def llm_parse_ocr_to_json(ocr_text: str) -> Tuple[Optional[dict], str, str, str]:
+def llm_parse_ocr_to_json(ocr_text: str) -> Tuple[Optional[dict], str, str]:
     """
-    Returns: (parsed_dict_or_none, raw_llm_output_or_errors, method, model_used)
-    method: text2text_generation | text_generation | chat_completion | error
+    Returns: (parsed_dict_or_none, raw_llm_text, model_used)
+    raw_llm_text will contain output or detailed errors (never None).
     """
     token = get_hf_token()
     if not token:
-        return None, "HF_TOKEN missing", "error", ""
-
-    # ✅ prioritize OCR_PARSER_MODEL (Flan-T5)
-    candidates = [CFG.OCR_PARSER_MODEL, CFG.CHAT_MODEL]
-    # uniqueness
-    seen = set()
-    candidates = [m for m in candidates if m and not (m in seen or seen.add(m))]
+        return None, "HF_TOKEN missing", ""
 
     prompt = (
         OCR_TO_JSON_PROMPT
@@ -577,59 +600,49 @@ def llm_parse_ocr_to_json(ocr_text: str) -> Tuple[Optional[dict], str, str, str]
         + "\n\nReturn ONLY JSON:"
     )
 
+    # Try parser model first, then optionally try CHAT_MODEL
+    models = [CFG.OCR_PARSER_MODEL, CFG.CHAT_MODEL]
+    seen = set()
+    models = [m for m in models if m and not (m in seen or seen.add(m))]
+
     errors: List[str] = []
 
-    for model_id in candidates:
-        client = InferenceClient(model=model_id, token=token, timeout=120)
-
-        # 1) text2text_generation (best for Flan-T5)
+    for model_id in models:
         try:
-            if hasattr(client, "text2text_generation"):
-                raw = client.text2text_generation(
-                    prompt,
-                    max_new_tokens=650,
-                )
-                # raw might be dict/str depending on hub version
-                raw_text = raw if isinstance(raw, str) else str(raw)
-                parsed = _extract_json_object(raw_text)
-                if isinstance(parsed, dict):
-                    return _clean_llm_dict(parsed), raw_text, "text2text_generation", model_id
-                errors.append(f"{model_id}: text2text_generation produced non-JSON")
-        except Exception as e:
-            errors.append(f"{model_id}: text2text_generation failed ({type(e).__name__}): {repr(e)}")
+            client = InferenceClient(model=model_id, token=token, timeout=120)
 
-        # 2) text_generation
-        try:
-            raw = client.text_generation(
-                prompt,
-                max_new_tokens=650,
-                temperature=0.1,
-                do_sample=False,
-                return_full_text=False,
-            )
+            payload = {
+                "inputs": prompt,
+                "parameters": {
+                    "max_new_tokens": 650,
+                    "temperature": 0.1,
+                    "return_full_text": False,
+                },
+                "options": {"wait_for_model": True},
+            }
+
+            resp = client.post(json=payload)
+            data = _decode_post_response(resp)
+
+            # Typical response is list of dicts: [{"generated_text": "..."}]
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                raw = data[0].get("generated_text") or data[0].get("text") or json.dumps(data)
+            elif isinstance(data, dict):
+                raw = data.get("generated_text") or data.get("text") or json.dumps(data)
+            else:
+                raw = str(data)
+
             parsed = _extract_json_object(raw)
             if isinstance(parsed, dict):
-                return _clean_llm_dict(parsed), raw, "text_generation", model_id
-            errors.append(f"{model_id}: text_generation produced non-JSON")
-        except Exception as e:
-            errors.append(f"{model_id}: text_generation failed ({type(e).__name__}): {repr(e)}")
+                # Ensure all keys exist
+                clean = {k: parsed.get(k, None) for k in EXPECTED_KEYS}
+                return clean, raw, model_id
 
-        # 3) chat_completion
-        try:
-            messages = [
-                {"role": "system", "content": "You extract Nutrition Facts. Output ONLY JSON."},
-                {"role": "user", "content": prompt},
-            ]
-            resp = client.chat_completion(messages=messages, max_tokens=650, temperature=0.1)
-            raw = resp.choices[0].message["content"]
-            parsed = _extract_json_object(raw)
-            if isinstance(parsed, dict):
-                return _clean_llm_dict(parsed), raw, "chat_completion", model_id
-            errors.append(f"{model_id}: chat_completion produced non-JSON")
+            errors.append(f"{model_id}: non-JSON output:\n{raw[:800]}")
         except Exception as e:
-            errors.append(f"{model_id}: chat_completion failed ({type(e).__name__}): {repr(e)}")
+            errors.append(f"{model_id}: failed ({type(e).__name__}): {repr(e)}")
 
-    return None, "\n".join(errors[:40]), "error", ""
+    return None, "\n\n".join(errors[:20]), ""
 
 
 def extract_nutrition_ocr(pil_img: Image.Image) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -656,33 +669,17 @@ def extract_nutrition_ocr(pil_img: Image.Image) -> Tuple[Optional[Dict[str, Any]
         backend = "local:easyocr"
 
     # ---- LLM parse ----
-    parsed, raw_llm, llm_method, llm_model_used = llm_parse_ocr_to_json(ocr_text)
+    parsed, raw_llm, llm_model_used = llm_parse_ocr_to_json(ocr_text)
 
-    parse_method = f"llm:{llm_method}"
+    parse_method = "llm"
     if not isinstance(parsed, dict):
         parse_method = "regex_fallback"
         rx = parse_nutrition_label_text(ocr_text)
-        parsed = {
-            "product_name": None,
-            "serving_size": rx.get("serving_size"),
-            "servings_per_container": None,
-            "calories": rx.get("calories"),
-            "total_fat_g": rx.get("total_fat_g"),
-            "saturated_fat_g": rx.get("saturated_fat_g"),
-            "trans_fat_g": rx.get("trans_fat_g"),
-            "cholesterol_mg": rx.get("cholesterol_mg"),
-            "sodium_mg": rx.get("sodium_mg"),
-            "total_carbohydrates_g": rx.get("total_carbohydrates_g"),
-            "dietary_fiber_g": rx.get("dietary_fiber_g"),
-            "total_sugars_g": rx.get("total_sugars_g"),
-            "added_sugars_g": rx.get("added_sugars_g"),
-            "protein_g": rx.get("protein_g"),
-        }
-        parsed = _clean_llm_dict(parsed)
+        parsed = {k: rx.get(k, None) for k in EXPECTED_KEYS}
 
     clean = {k: parsed.get(k, None) for k in EXPECTED_KEYS}
     clean["raw_ocr_text"] = ocr_text
-    clean["raw_llm_text"] = raw_llm  # never None now
+    clean["raw_llm_text"] = raw_llm  # ✅ always contains output or errors
     clean["parse_method"] = parse_method
     clean["ocr_backend"] = backend
     clean["llm_model_used"] = llm_model_used
@@ -944,7 +941,7 @@ with tab_scan:
 # =========================================================
 with tab_ocr:
     st.markdown("Upload or capture a packaged product label (**Nutrition Facts**).")
-    st.caption("OCR tries HF Serverless first, then falls back to local EasyOCR (if installed).")
+    st.caption("OCR tries HF first, then falls back to local EasyOCR (if installed).")
 
     a, b = st.columns(2)
 
