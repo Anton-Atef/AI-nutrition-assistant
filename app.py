@@ -2,24 +2,24 @@
 #  🥗 AI Nutrition & Smart Shopping Assistant — Streamlit
 #  Streamlit Community Cloud friendly
 #
-#  ✅ Nutrition model downloaded from HF Hub:
+#  ✅ Nutrition model (download at runtime from HF Hub):
 #     Anton-Atef/AI-nutrition-assistant/best_nutrition_rgbd.pt
 #
-#  ✅ OCR:
-#     - Try HF OCR (image-to-text) models
-#     - Fallback to local EasyOCR
+#  ✅ OCR (Robust):
+#     1) Try HF OCR models (image-to-text) in a fallback list
+#     2) If HF OCR fails -> fallback to LOCAL EasyOCR (recommended)
 #
-#  ✅ OCR parsing (LLM -> JSON):
-#     - Uses OCR_PARSER_MODEL (Flan-T5 recommended) via text2text_generation()
-#     - Never uses InferenceClient.post() (fixes AttributeError forever)
-#     - Always stores raw_llm_text (output OR error)
-#     - If LLM fails: hardened regex parser with sanity checks
+#  ✅ OCR Parsing (Fix "forever"):
+#     - Primary: HF Inference HTTP (requests) to OCR_PARSER_MODEL (Flan-T5 recommended)
+#       (This avoids huggingface_hub method compatibility issues entirely.)
+#     - Fallback: hardened regex parser with sanity checks (prevents nonsense values)
 #
-#  ✅ Voice ASR (HF): openai/whisper-large-v3
-#  ✅ Coach chat: from Secrets (may fail on serverless; rule replies still work)
+#  ✅ Voice ASR (HF Inference API): openai/whisper-large-v3
+#  ✅ Coach chat: uses HF InferenceClient if available; otherwise rule-based fallback
 #
 #  IMPORTANT:
 #  - Put HF_TOKEN in Streamlit Secrets (do not hardcode).
+#  - Rotate/revoke any token you ever pasted publicly.
 # =========================================================
 
 import os, io, re, json, time
@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 import cv2
+import requests
 
 import streamlit as st
 
@@ -201,15 +202,14 @@ class CFG:
 
     CHAT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
     ASR_MODEL = "openai/whisper-large-v3"
-
     OCR_MODEL = "microsoft/trocr-base-printed"
 
-    # ✅ Dedicated model for OCR text -> JSON parsing
-    OCR_PARSER_MODEL = "google/flan-t5-small"  # small is more likely to run than base
+    # Dedicated model for OCR TEXT -> JSON parsing
+    OCR_PARSER_MODEL = "google/flan-t5-small"
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Optional overrides
+# Optional overrides from Secrets
 CFG.MODEL_REPO_ID = _secret("MODEL_REPO_ID", CFG.MODEL_REPO_ID)
 CFG.MODEL_FILENAME = _secret("MODEL_FILENAME", CFG.MODEL_FILENAME)
 CFG.CHAT_MODEL = _secret("CHAT_MODEL", CFG.CHAT_MODEL)
@@ -220,10 +220,14 @@ CFG.OCR_PARSER_MODEL = _secret("OCR_PARSER_MODEL", CFG.OCR_PARSER_MODEL)
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
+try:
+    torch.set_num_threads(max(1, min(4, os.cpu_count() or 2)))
+except Exception:
+    pass
+
 
 # -----------------------------
-# Utility: build InferenceClient safely
-# (works across hub versions and with/without provider routing)
+# Helper: safe InferenceClient
 # -----------------------------
 def make_client(model_id: str) -> Optional[InferenceClient]:
     token = get_hf_token()
@@ -232,7 +236,6 @@ def make_client(model_id: str) -> Optional[InferenceClient]:
     try:
         return InferenceClient(model=model_id, token=token, timeout=120)
     except TypeError:
-        # older signature fallback
         return InferenceClient(model=model_id, token=token)
 
 
@@ -327,7 +330,7 @@ def hf_client_asr():
 
 
 # -----------------------------
-# 🧾 OCR + parsing
+# 🧾 OCR + Parsing
 # -----------------------------
 EXPECTED_KEYS = [
     "product_name",
@@ -477,7 +480,7 @@ def _rotate_pil(img: Image.Image, angle: int) -> Image.Image:
 
 def _keyword_score(txt: str) -> int:
     t = (txt or "").lower()
-    kws = ["calories", "serving", "total", "fat", "protein", "carbohydrate", "sodium", "sugars"]
+    kws = ["calories", "serving", "total", "fat", "protein", "carbohydrate", "sodium", "sugars", "cholesterol"]
     return sum(t.count(k) for k in kws)
 
 def _try_local_easyocr(pil_img: Image.Image) -> Tuple[Optional[str], Optional[str]]:
@@ -505,39 +508,146 @@ def _try_local_easyocr(pil_img: Image.Image) -> Tuple[Optional[str], Optional[st
 
 
 # -----------------------------
-# ✅ Hardened Regex Parser (fixes wrong 96g added sugars etc.)
+# ✅ LLM parsing via HTTP (requests) — never depends on hub version
+# -----------------------------
+def hf_inference_generate_text(model_id: str, prompt: str) -> Tuple[Optional[str], Optional[str]]:
+    token = get_hf_token()
+    if not token:
+        return None, "HF_TOKEN missing"
+
+    url = f"https://api-inference.huggingface.co/models/{model_id}"
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": 650,
+            "temperature": 0.1,
+            "return_full_text": False,
+        },
+        "options": {"wait_for_model": True},
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=120)
+        try:
+            data = r.json()
+        except Exception:
+            data = r.text
+
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}: {data}"
+
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            txt = data[0].get("generated_text") or data[0].get("text")
+            return (txt or str(data)).strip(), None
+
+        if isinstance(data, dict):
+            txt = data.get("generated_text") or data.get("text")
+            return (txt or json.dumps(data)).strip(), None
+
+        return str(data).strip(), None
+
+    except Exception as e:
+        return None, f"requests failed ({type(e).__name__}): {repr(e)}"
+
+
+def llm_parse_ocr_to_json(ocr_text: str) -> Tuple[Optional[dict], str, str]:
+    """
+    Returns: (parsed_dict_or_none, raw_llm_text_or_error, model_used)
+    raw_llm_text is NEVER None.
+    """
+    model_id = CFG.OCR_PARSER_MODEL
+
+    prompt = (
+        OCR_TO_JSON_PROMPT
+        + "\n\nOCR TEXT:\n"
+        + (ocr_text or "")
+        + "\n\nReturn ONLY JSON:"
+    )
+
+    out, err = hf_inference_generate_text(model_id, prompt)
+    if err:
+        return None, err, model_id
+
+    parsed = _extract_json_object(out)
+    if isinstance(parsed, dict):
+        clean = {k: parsed.get(k, None) for k in EXPECTED_KEYS}
+        return clean, out, model_id
+
+    return None, out, model_id
+
+
+# -----------------------------
+# ✅ Hardened Regex Parser (corrects common OCR mistakes + sanity checks)
 # -----------------------------
 def _normalize_ocr_text(text: str) -> str:
     raw = text or ""
     t = raw.replace("\u00a0", " ").replace("_", " ")
     t = t.replace(",", ".")
-    # Fix "2 5.9" -> "2.5 9"
-    t = re.sub(r"(\d)\s+(\d)\s*\.\s*", r"\1.\2 ", t)
-    # Insert spaces between letters and digits
+    t = re.sub(r"(\d)\s+(\d)\s*\.\s*", r"\1.\2 ", t)  # "2 5.9" -> "2.5 9"
     t = re.sub(r"([A-Za-z])(\d)", r"\1 \2", t)
     t = re.sub(r"(\d)([A-Za-z])", r"\1 \2", t)
-    # common OCR misreads
+    t = re.sub(r"\s+", " ", t)
+
     tl = t.lower()
+    # common OCR words
     tl = re.sub(r"\biolal\b", "total", tl)
     tl = re.sub(r"\bcaloies\b|\bcaloies\b|\bcaloies\b|\bcaloies\b", "calories", tl)
     tl = re.sub(r"\bcrdlesterol\b", "cholesterol", tl)
     tl = re.sub(r"carbolydra\w+|carbohydra\w+", "carbohydrate", tl)
     tl = re.sub(r"saturaled|saturatcd", "saturated", tl)
     tl = re.sub(r"scaium", "sodium", tl)
-    # "t10" -> "710" (common OCR)
+
+    # total fat variants like totalfal/totalfat
+    tl = re.sub(r"\btotalfat\b", "total fat", tl)
+    tl = re.sub(r"\btotalfal\b", "total fat", tl)
+    tl = re.sub(r"\btotal\s*fa[lt]\b", "total fat", tl)
+
+    # mg OCR noise
+    tl = tl.replace(" m9", " mg").replace(" mo", " mg")
+
+    # sodium OCR: "t10" -> "710"
     tl = re.sub(r"\bt(\d{2,})\b", r"7\1", tl)
-    tl = re.sub(r"\s+", " ", tl).strip()
-    return tl
+
+    return tl.strip()
+
 
 def parse_nutrition_label_text(text: str) -> Dict[str, Any]:
     raw = text or ""
     t = _normalize_ocr_text(raw)
 
-    def near(keyword_pat: str, unit_pat: Optional[str] = None, window: int = 80) -> Optional[float]:
-        m = re.search(keyword_pat, t, re.I)
+    # serving size: keep up to first ')'
+    serving_size = None
+    m_ss = re.search(r"serving\s*size\s*(.+?)(?:servings?\s*per\s*container|$)", raw, re.I)
+    if m_ss:
+        ss = m_ss.group(1).strip()
+        if ")" in ss:
+            ss = ss.split(")")[0] + ")"
+        # fix "(39. 169)" -> "(39.169)" then -> "(39.169)" ; then remove extra trailing numbers if present
+        ss = re.sub(r"\((\d+(?:\.\d+)?)(?:\s+\d+(?:\.\d+)?)+\)", r"(\1)", ss)
+        serving_size = ss.strip() or None
+
+    spc = None
+    m_spc = re.search(r"servings?\s*per\s*container\s*(\d+\.?\d*)", t, re.I)
+    if m_spc:
+        try:
+            spc = float(m_spc.group(1))
+        except:
+            spc = None
+
+    def value_after(label_pat: str, stop_pats: List[str], unit_pat: Optional[str] = None, window: int = 140) -> Optional[float]:
+        m = re.search(label_pat, t, re.I)
         if not m:
             return None
         chunk = t[m.end() : m.end() + window]
+
+        stop_idx = None
+        for sp in stop_pats:
+            ms = re.search(sp, chunk, re.I)
+            if ms:
+                stop_idx = ms.start() if stop_idx is None else min(stop_idx, ms.start())
+        if stop_idx is not None:
+            chunk = chunk[:stop_idx]
 
         if unit_pat:
             m2 = re.search(r"(\d+(?:\.\d+)?)\s*(?:%s)" % unit_pat, chunk, re.I)
@@ -547,41 +657,18 @@ def parse_nutrition_label_text(text: str) -> Dict[str, Any]:
                 except:
                     return None
 
-        m3 = re.search(r"(\d+(?:\.\d+)?)", chunk)
-        if m3:
+        # first number not followed by %
+        for m3 in re.finditer(r"\d+(?:\.\d+)?", chunk):
+            after = chunk[m3.end() : m3.end() + 3]
+            if "%" in after:
+                continue
             try:
-                return float(m3.group(1))
+                return float(m3.group(0))
             except:
-                return None
+                continue
         return None
 
-    # serving size text
-    serving_size = None
-    m_ss = re.search(r"serving\s*size\s*(.+?)(?:servings?\s*per\s*container|$)", raw, re.I)
-    if m_ss:
-        serving_size = m_ss.group(1).strip()
-
-    # servings per container
-    spc = None
-    m_spc = re.search(r"servings?\s*per\s*container\s*(\d+\.?\d*)", t, re.I)
-    if m_spc:
-        try:
-            spc = float(m_spc.group(1))
-        except:
-            spc = None
-
-    calories = near(r"\bcalories?\b", None)
-    total_fat = near(r"\btotal\s*fat\b", r"g|gm")
-    sat_fat = near(r"\bsaturated\s*fat\b", r"g|gm")
-    trans_fat = near(r"\btrans\s*fat\b", r"g|gm")
-    chol = near(r"\bcholesterol\b", r"mg|m\s*g")
-    sodium = near(r"\bsodium\b", r"mg|m\s*g")
-    carbs = near(r"\btotal\s*carbohydrate[s]?\b", r"g|gm")
-    fiber = near(r"\b(dietary\s*)?fiber\b", r"g|gm")
-    sugars = near(r"\btotal\s*sugars?\b", r"g|gm")
-    protein = near(r"\bprotein\b", r"g|gm")
-
-    # Added sugars: prefer "includes X g added sugars"
+    # prefer "includes X g added sugars"
     added = None
     m_inc = re.search(r"includes?\s*(\d+(?:\.\d+)?)\s*g\s*added\s*sugars?", t, re.I)
     if m_inc:
@@ -589,18 +676,35 @@ def parse_nutrition_label_text(text: str) -> Dict[str, Any]:
             added = float(m_inc.group(1))
         except:
             added = None
-    if added is None:
-        added = near(r"\badded\s*sugars?\b", r"g|gm")
 
-    # ---- sanity rules to prevent nonsense values ----
-    if total_fat is not None and sat_fat is not None and sat_fat > total_fat + 0.5:
-        sat_fat = None
-    if added is not None and sugars is not None and added > sugars + 2:
+    calories = value_after(r"\bcalories?\b", stop_pats=[r"\btotal\s*fat\b", r"\bcholesterol\b"])
+    total_fat = value_after(r"\btotal\s*fat\b", stop_pats=[r"\bsaturated\s*fat\b", r"\bcholesterol\b", r"\btotal\s*carbohydrate"], unit_pat=r"g|gm")
+    sat_fat = value_after(r"\bsaturated\s*fat\b", stop_pats=[r"\btrans\s*fat\b", r"\bcholesterol\b"], unit_pat=r"g|gm")
+    trans_fat = value_after(r"\btrans\s*fat\b", stop_pats=[r"\bcholesterol\b"], unit_pat=r"g|gm")
+    chol = value_after(r"\bcholesterol\b", stop_pats=[r"\bsodium\b", r"\btotal\s*carbohydrate"], unit_pat=r"mg|m\s*g")
+    sodium = value_after(r"\bsodium\b", stop_pats=[r"\bpotassium\b", r"\btotal\s*carbohydrate"], unit_pat=r"mg|m\s*g")
+    carbs = value_after(r"\btotal\s*carbohydrate[s]?\b", stop_pats=[r"\btotal\s*sugars?\b", r"\bprotein\b"], unit_pat=r"g|gm")
+    sugars = value_after(r"\btotal\s*sugars?\b", stop_pats=[r"\bprotein\b"], unit_pat=r"g|gm")
+    protein = value_after(r"\bprotein\b", stop_pats=[r"$"], unit_pat=r"g|gm")
+
+    if added is None:
+        added = value_after(r"\badded\s*sugars?\b", stop_pats=[r"\bprotein\b"], unit_pat=r"g|gm")
+
+    # ---- Sanity fixes ----
+    # Fix saturated fat OCR like "59" -> "0.59" when total fat is small
+    if sat_fat is not None and total_fat is not None and sat_fat > total_fat + 0.5:
+        if 10 <= sat_fat <= 99 and total_fat <= 10:
+            sat_fat = round(sat_fat / 100.0, 2)
+        if sat_fat > total_fat + 0.5:
+            sat_fat = None
+
+    # Added sugars cannot exceed total sugars
+    if sugars is not None and added is not None and added > sugars + 2:
         added = None
     if added is not None and added > 50:
         added = None
-    if carbs is not None and carbs > 300:
-        carbs = None
+
+    # Sodium sanity
     if sodium is not None and sodium > 20000:
         sodium = None
 
@@ -615,83 +719,12 @@ def parse_nutrition_label_text(text: str) -> Dict[str, Any]:
         "cholesterol_mg": chol,
         "sodium_mg": sodium,
         "total_carbohydrates_g": carbs,
-        "dietary_fiber_g": fiber,
+        "dietary_fiber_g": None,
         "total_sugars_g": sugars,
         "added_sugars_g": added,
         "protein_g": protein,
         "raw_text": raw[:800],
     }
-
-
-# -----------------------------
-# ✅ LLM parser (NO .post)
-# Uses text2text_generation for Flan models
-# -----------------------------
-def _extract_generated_text(res: Any) -> str:
-    if res is None:
-        return ""
-    if isinstance(res, str):
-        return res
-    if isinstance(res, dict):
-        return res.get("generated_text") or res.get("text") or json.dumps(res)
-    # huggingface_hub output objects stringify fine
-    return str(res)
-
-def llm_parse_ocr_to_json(ocr_text: str) -> Tuple[Optional[dict], str, str]:
-    """
-    Returns: (parsed_dict_or_none, raw_llm_text_or_error, model_used)
-    raw_llm_text is NEVER None.
-    """
-    token = get_hf_token()
-    if not token:
-        return None, "HF_TOKEN missing", ""
-
-    model_id = CFG.OCR_PARSER_MODEL
-    client = make_client(model_id)
-    if client is None:
-        return None, "HF_TOKEN missing", ""
-
-    prompt = (
-        OCR_TO_JSON_PROMPT
-        + "\n\nOCR TEXT:\n"
-        + (ocr_text or "")
-        + "\n\nReturn ONLY JSON:"
-    )
-
-    # 1) Prefer text2text_generation for Flan-T5
-    try:
-        if hasattr(client, "text2text_generation"):
-            res = client.text2text_generation(prompt, max_new_tokens=650)
-            raw = _extract_generated_text(res)
-            parsed = _extract_json_object(raw)
-            if isinstance(parsed, dict):
-                clean = {k: parsed.get(k, None) for k in EXPECTED_KEYS}
-                return clean, raw, model_id
-            return None, raw, model_id
-    except Exception as e:
-        err1 = f"{model_id}: text2text_generation failed ({type(e).__name__}): {repr(e)}"
-    else:
-        err1 = f"{model_id}: text2text_generation not available in this huggingface_hub version."
-
-    # 2) Fallback to text_generation (some environments expose only this)
-    try:
-        res = client.text_generation(
-            prompt,
-            max_new_tokens=650,
-            temperature=0.1,
-            do_sample=False,
-            return_full_text=False,
-        )
-        raw = _extract_generated_text(res)
-        parsed = _extract_json_object(raw)
-        if isinstance(parsed, dict):
-            clean = {k: parsed.get(k, None) for k in EXPECTED_KEYS}
-            return clean, raw, model_id
-        return None, raw, model_id
-    except Exception as e:
-        err2 = f"{model_id}: text_generation failed ({type(e).__name__}): {repr(e)}"
-
-    return None, err1 + "\n" + err2, model_id
 
 
 def extract_nutrition_ocr(pil_img: Image.Image) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -718,10 +751,9 @@ def extract_nutrition_ocr(pil_img: Image.Image) -> Tuple[Optional[Dict[str, Any]
             return None, msg
         backend = "local:easyocr"
 
-    # 2) LLM parse -> JSON
-    parsed, raw_llm, llm_used = llm_parse_ocr_to_json(ocr_text)
+    # 2) LLM parse (HTTP)
+    parsed, raw_llm, llm_model_used = llm_parse_ocr_to_json(ocr_text)
 
-    # 3) Regex fallback
     parse_method = "llm"
     if not isinstance(parsed, dict):
         parse_method = "regex_fallback"
@@ -730,20 +762,21 @@ def extract_nutrition_ocr(pil_img: Image.Image) -> Tuple[Optional[Dict[str, Any]
 
     clean = {k: parsed.get(k, None) for k in EXPECTED_KEYS}
     clean["raw_ocr_text"] = ocr_text
-    clean["raw_llm_text"] = raw_llm  # never None
+    clean["raw_llm_text"] = raw_llm  # ALWAYS contains output or error
     clean["parse_method"] = parse_method
     clean["ocr_backend"] = backend
-    clean["llm_model_used"] = llm_used if parse_method == "llm" else ""
+    clean["llm_model_used"] = llm_model_used if parse_method == "llm" else ""
     return clean, None
 
 
 # -----------------------------
-# 🎙️ ASR
+# 🎙️ ASR (Whisper via HF)
 # -----------------------------
 def transcribe_audio_hf(audio_bytes: bytes) -> Tuple[Optional[str], Optional[str]]:
     client = hf_client_asr()
     if client is None:
         return None, "HF_TOKEN missing. Add it in Streamlit Secrets to enable voice."
+
     try:
         if hasattr(client, "automatic_speech_recognition"):
             res = client.automatic_speech_recognition(audio=audio_bytes)
@@ -765,7 +798,7 @@ def transcribe_audio_hf(audio_bytes: bytes) -> Tuple[Optional[str], Optional[str
 
 
 # -----------------------------
-# 🧭 ROUTER + COACH
+# 🧭 SIMPLE ROUTER
 # -----------------------------
 class Route:
     def __init__(self, intent: str, confidence: float):
@@ -991,7 +1024,7 @@ with tab_scan:
 # =========================================================
 with tab_ocr:
     st.markdown("Upload or capture a packaged product label (**Nutrition Facts / Supplement Facts**).")
-    st.caption("OCR tries HF first, then falls back to local EasyOCR (if installed).")
+    st.caption("OCR tries HF first, then falls back to local EasyOCR (recommended).")
 
     a, b = st.columns(2)
 
@@ -1037,7 +1070,7 @@ with tab_ocr:
 
         with st.expander("Debug: raw OCR text"):
             st.write(raw_ocr)
-        with st.expander("Debug: raw parser (LLM) output"):
+        with st.expander("Debug: raw parser (LLM) output / error"):
             st.write(raw_llm)
 
 
@@ -1193,7 +1226,6 @@ with tab_chat:
                 {"role": "system", "content": SYSTEM_PROMPT + "\nTrusted context:\n" + json.dumps(ctx)},
                 {"role": "user", "content": message},
             ]
-            # May fail depending on provider support; handled by except
             resp = client.chat_completion(messages=messages, max_tokens=400, temperature=0.7)
             return resp.choices[0].message["content"]
         except Exception:
