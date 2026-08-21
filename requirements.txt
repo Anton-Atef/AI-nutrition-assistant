@@ -1,21 +1,15 @@
 streamlit>=1.36
-
 torch>=2.1
 torchvision>=0.16
 timm>=0.9
-
 opencv-python-headless
 pillow
 numpy
 pandas
-
-huggingface_hub>=0.30.0
-requests>=2.31.0
-
-# Local OCR fallback (recommended)
+huggingface_hub>=0.26
 easyocr>=1.7.1
 scipy
 pyyaml
 python-bidi
-Shapely>=2.0.0
+Shapely
 pyclipper
