@@ -5,23 +5,19 @@
 #  ✅ Nutrition model (200MB) downloaded at runtime from HF Hub:
 #     Anton-Atef/AI-nutrition-assistant/best_nutrition_rgbd.pt
 #
-#  ✅ Chat (HF Inference API): (from Secrets) default Qwen/Qwen2.5-7B-Instruct
-#     - For OCR parsing we also try serverless-friendly fallback chat models if Qwen fails.
-#
-#  ✅ Voice ASR (HF Inference API): openai/whisper-large-v3
+#  ✅ Chat (HF Inference API): from Secrets (may or may not be serverless-supported)
+#  ✅ Voice ASR (HF Inference API): from Secrets
 #
 #  ✅ OCR (Robust):
-#     1) Try HF Serverless OCR models (image-to-text) in a fallback list (provider=hf-inference)
+#     1) Try HF Serverless OCR models (image-to-text) in a fallback list
 #     2) If HF OCR is not available/not supported -> fallback to LOCAL EasyOCR (optional)
-#     3) Parse extracted OCR text into strict JSON using an LLM:
-#          - Try chat_completion, then fallback to text_generation
-#          - If main chat model fails, try fallback chat models
-#          - Always stores raw_llm_text (output OR errors) so Debug is never "None"
-#     4) If LLM JSON fails -> fallback to your regex parser
+#     3) Parse extracted OCR text into strict JSON using OCR_PARSER_MODEL (Flan-T5 recommended)
+#        - tries: text2text_generation -> text_generation -> chat_completion
+#        - always stores raw_llm_text (output OR errors)
+#     4) If LLM JSON fails -> fallback to regex parser
 #
 #  IMPORTANT:
 #  - Put HF_TOKEN in Streamlit Secrets (do not hardcode).
-#  - If HF OCR fails on serverless, install easyocr (requirements) for local OCR fallback.
 # =========================================================
 
 import os, io, re, json, time
@@ -177,6 +173,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
 # -----------------------------
 # 🔐 Secrets helper
 # -----------------------------
@@ -188,6 +185,7 @@ def _secret(key: str, default=None):
 
 def get_hf_token() -> Optional[str]:
     return _secret("HF_TOKEN", None)
+
 
 # -----------------------------
 # ⚙️ CONFIG
@@ -204,24 +202,22 @@ class CFG:
     CHAT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
     ASR_MODEL = "openai/whisper-large-v3"
 
-    # preferred OCR model (we still try, but serverless availability changes)
+    # preferred OCR model (serverless support varies)
     OCR_MODEL = "microsoft/trocr-base-printed"
+
+    # ✅ Dedicated parser model for OCR text -> JSON (serverless-friendly)
+    OCR_PARSER_MODEL = "google/flan-t5-base"
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Optional overrides
+
+# Optional overrides from Secrets
 CFG.MODEL_REPO_ID = _secret("MODEL_REPO_ID", CFG.MODEL_REPO_ID)
 CFG.MODEL_FILENAME = _secret("MODEL_FILENAME", CFG.MODEL_FILENAME)
 CFG.CHAT_MODEL = _secret("CHAT_MODEL", CFG.CHAT_MODEL)
 CFG.ASR_MODEL = _secret("ASR_MODEL", CFG.ASR_MODEL)
 CFG.OCR_MODEL = _secret("OCR_MODEL", CFG.OCR_MODEL)
-
-# LLM fallback models for OCR parsing (serverless-friendly)
-LLM_FALLBACK_MODELS: List[str] = [
-    # If Qwen is not supported on hf-inference, these often work:
-    "HuggingFaceH4/zephyr-7b-beta",
-    "mistralai/Mistral-7B-Instruct-v0.2",
-]
+CFG.OCR_PARSER_MODEL = _secret("OCR_PARSER_MODEL", CFG.OCR_PARSER_MODEL)
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -311,19 +307,17 @@ def predict_nutrition(pil_img: Image.Image) -> Dict[str, float]:
 
 
 # -----------------------------
-# 🤖 HF CLIENTS (Chat / ASR) — provider enforced
+# 🤖 HF CLIENTS (Chat / ASR)
 # -----------------------------
-HF_PROVIDER = "hf-inference"
-
 @st.cache_resource
 def hf_client_text():
     token = get_hf_token()
-    return InferenceClient(model=CFG.CHAT_MODEL, token=token, timeout=120, provider=HF_PROVIDER) if token else None
+    return InferenceClient(model=CFG.CHAT_MODEL, token=token, timeout=120) if token else None
 
 @st.cache_resource
 def hf_client_asr():
     token = get_hf_token()
-    return InferenceClient(model=CFG.ASR_MODEL, token=token, timeout=120, provider=HF_PROVIDER) if token else None
+    return InferenceClient(model=CFG.ASR_MODEL, token=token, timeout=120) if token else None
 
 
 # -----------------------------
@@ -416,7 +410,7 @@ def _pil_to_png_bytes(pil_img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
-# --------- OCR PARSER (YOUR PROVIDED ONE) ---------
+# --------- YOUR OCR PARSER (kept) ---------
 def parse_nutrition_label_text(text: str) -> Dict:
     t = (text or "").lower()
 
@@ -456,10 +450,6 @@ def _normalize_ocr_out(ocr_out: Any) -> str:
 
 
 def _try_hf_ocr(png_bytes: bytes) -> Tuple[Optional[str], Optional[str], List[str]]:
-    """
-    Attempts OCR via HF Serverless `hf-inference` for multiple image-to-text models.
-    Returns: (ocr_text or None, model_used or None, errors[])
-    """
     token = get_hf_token()
     if not token:
         return None, None, ["HF_TOKEN missing"]
@@ -481,7 +471,7 @@ def _try_hf_ocr(png_bytes: bytes) -> Tuple[Optional[str], Optional[str], List[st
     errors: List[str] = []
     for model_id in candidates:
         try:
-            client = InferenceClient(model=model_id, token=token, timeout=120, provider=HF_PROVIDER)
+            client = InferenceClient(model=model_id, token=token, timeout=120)
             out = client.image_to_text(png_bytes)
             text = _normalize_ocr_out(out)
             if len(text) >= 10:
@@ -496,10 +486,6 @@ def _try_hf_ocr(png_bytes: bytes) -> Tuple[Optional[str], Optional[str], List[st
 
 @st.cache_resource
 def load_easyocr_reader():
-    """
-    Local OCR fallback (optional). Only used if HF OCR fails.
-    Requires: easyocr in requirements.txt
-    """
     try:
         import easyocr  # noqa
         return easyocr.Reader(["en"], gpu=False)
@@ -510,9 +496,7 @@ def load_easyocr_reader():
 def _try_local_easyocr(pil_img: Image.Image) -> Tuple[Optional[str], Optional[str]]:
     reader = load_easyocr_reader()
     if reader is None:
-        return None, (
-            "EasyOCR not installed. Add `easyocr` to requirements.txt to enable local OCR fallback."
-        )
+        return None, "EasyOCR not installed. Add `easyocr` to requirements.txt to enable local OCR fallback."
     try:
         prep = preprocess_label_for_ocr(pil_img)
         arr = np.array(prep)
@@ -545,12 +529,8 @@ def _coerce_number(x: Any) -> Optional[float]:
 
 
 def _clean_llm_dict(d: dict) -> dict:
-    """
-    Ensure expected keys exist and numeric fields are numbers or None.
-    """
     out = {k: d.get(k, None) for k in EXPECTED_KEYS}
 
-    # numeric coercion
     for k in [
         "servings_per_container",
         "calories",
@@ -567,7 +547,6 @@ def _clean_llm_dict(d: dict) -> dict:
     ]:
         out[k] = _coerce_number(out.get(k, None))
 
-    # strings
     if out.get("product_name") is not None:
         out["product_name"] = str(out["product_name"]).strip() or None
     if out.get("serving_size") is not None:
@@ -578,16 +557,18 @@ def _clean_llm_dict(d: dict) -> dict:
 
 def llm_parse_ocr_to_json(ocr_text: str) -> Tuple[Optional[dict], str, str, str]:
     """
-    Try to convert OCR text -> strict JSON using an LLM.
     Returns: (parsed_dict_or_none, raw_llm_output_or_errors, method, model_used)
-      method: chat_completion | text_generation | error
+    method: text2text_generation | text_generation | chat_completion | error
     """
     token = get_hf_token()
     if not token:
         return None, "HF_TOKEN missing", "error", ""
 
-    models = [CFG.CHAT_MODEL] + [m for m in LLM_FALLBACK_MODELS if m != CFG.CHAT_MODEL]
-    errors: List[str] = []
+    # ✅ prioritize OCR_PARSER_MODEL (Flan-T5)
+    candidates = [CFG.OCR_PARSER_MODEL, CFG.CHAT_MODEL]
+    # uniqueness
+    seen = set()
+    candidates = [m for m in candidates if m and not (m in seen or seen.add(m))]
 
     prompt = (
         OCR_TO_JSON_PROMPT
@@ -596,25 +577,28 @@ def llm_parse_ocr_to_json(ocr_text: str) -> Tuple[Optional[dict], str, str, str]
         + "\n\nReturn ONLY JSON:"
     )
 
-    for model_id in models:
-        client = InferenceClient(model=model_id, token=token, timeout=120, provider=HF_PROVIDER)
+    errors: List[str] = []
 
-        # 1) chat_completion
+    for model_id in candidates:
+        client = InferenceClient(model=model_id, token=token, timeout=120)
+
+        # 1) text2text_generation (best for Flan-T5)
         try:
-            messages = [
-                {"role": "system", "content": "You extract Nutrition Facts. Output ONLY JSON."},
-                {"role": "user", "content": prompt},
-            ]
-            resp = client.chat_completion(messages=messages, max_tokens=650, temperature=0.1)
-            raw = resp.choices[0].message["content"]
-            parsed = _extract_json_object(raw)
-            if isinstance(parsed, dict):
-                return _clean_llm_dict(parsed), raw, "chat_completion", model_id
-            errors.append(f"{model_id}: chat_completion produced non-JSON")
+            if hasattr(client, "text2text_generation"):
+                raw = client.text2text_generation(
+                    prompt,
+                    max_new_tokens=650,
+                )
+                # raw might be dict/str depending on hub version
+                raw_text = raw if isinstance(raw, str) else str(raw)
+                parsed = _extract_json_object(raw_text)
+                if isinstance(parsed, dict):
+                    return _clean_llm_dict(parsed), raw_text, "text2text_generation", model_id
+                errors.append(f"{model_id}: text2text_generation produced non-JSON")
         except Exception as e:
-            errors.append(f"{model_id}: chat_completion failed ({type(e).__name__}): {repr(e)}")
+            errors.append(f"{model_id}: text2text_generation failed ({type(e).__name__}): {repr(e)}")
 
-        # 2) text_generation fallback
+        # 2) text_generation
         try:
             raw = client.text_generation(
                 prompt,
@@ -630,16 +614,25 @@ def llm_parse_ocr_to_json(ocr_text: str) -> Tuple[Optional[dict], str, str, str]
         except Exception as e:
             errors.append(f"{model_id}: text_generation failed ({type(e).__name__}): {repr(e)}")
 
-    return None, "\n".join(errors[:30]), "error", ""
+        # 3) chat_completion
+        try:
+            messages = [
+                {"role": "system", "content": "You extract Nutrition Facts. Output ONLY JSON."},
+                {"role": "user", "content": prompt},
+            ]
+            resp = client.chat_completion(messages=messages, max_tokens=650, temperature=0.1)
+            raw = resp.choices[0].message["content"]
+            parsed = _extract_json_object(raw)
+            if isinstance(parsed, dict):
+                return _clean_llm_dict(parsed), raw, "chat_completion", model_id
+            errors.append(f"{model_id}: chat_completion produced non-JSON")
+        except Exception as e:
+            errors.append(f"{model_id}: chat_completion failed ({type(e).__name__}): {repr(e)}")
+
+    return None, "\n".join(errors[:40]), "error", ""
 
 
 def extract_nutrition_ocr(pil_img: Image.Image) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    1) Try HF OCR models (serverless)
-    2) If fails -> local EasyOCR (optional)
-    3) Parse to strict JSON using LLM (chat_completion -> text_generation; model fallbacks)
-    4) Fallback to your regex parser
-    """
     token = get_hf_token()
     if not token:
         return None, "HF_TOKEN missing. Add it in Streamlit Secrets."
@@ -649,7 +642,6 @@ def extract_nutrition_ocr(pil_img: Image.Image) -> Tuple[Optional[Dict[str, Any]
 
     ocr_text, used_model, hf_errors = _try_hf_ocr(png_bytes)
 
-    backend = None
     if ocr_text:
         backend = f"hf:{used_model}"
     else:
@@ -663,10 +655,9 @@ def extract_nutrition_ocr(pil_img: Image.Image) -> Tuple[Optional[Dict[str, Any]
             return None, msg
         backend = "local:easyocr"
 
-    # ---- LLM parse step (THIS IS THE FIX: always produce raw_llm_text) ----
+    # ---- LLM parse ----
     parsed, raw_llm, llm_method, llm_model_used = llm_parse_ocr_to_json(ocr_text)
 
-    # Regex fallback if LLM fails
     parse_method = f"llm:{llm_method}"
     if not isinstance(parsed, dict):
         parse_method = "regex_fallback"
@@ -691,7 +682,7 @@ def extract_nutrition_ocr(pil_img: Image.Image) -> Tuple[Optional[Dict[str, Any]
 
     clean = {k: parsed.get(k, None) for k in EXPECTED_KEYS}
     clean["raw_ocr_text"] = ocr_text
-    clean["raw_llm_text"] = raw_llm  # ✅ now shows output OR detailed error strings
+    clean["raw_llm_text"] = raw_llm  # never None now
     clean["parse_method"] = parse_method
     clean["ocr_backend"] = backend
     clean["llm_model_used"] = llm_model_used
