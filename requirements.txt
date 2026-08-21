@@ -15,5 +15,5 @@ easyocr>=1.7.1
 scipy
 pyyaml
 python-bidi
-Shapely
+Shapely>=2.0.0
 pyclipper
